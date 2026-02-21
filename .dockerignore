@@ -1,0 +1,14 @@
+.git
+.claude
+.DS_Store
+.env
+.env.*
+node_modules
+web/node_modules
+bin/
+uploads/
+docs/
+*.log
+*.md
+!go.mod
+!go.sum

@@ -1,0 +1,45 @@
+# Go
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+vendor/
+
+# Go build/test cache
+*.test
+*.out
+__debug_bin*
+
+# Frontend
+node_modules/
+dist/
+build/
+web/build/
+
+# Environment
+.env
+.env.*
+
+# Internal docs (dev reference, not for public repo)
+docs/internal/
+
+# Claude Code project instructions
+CLAUDE.md
+.claude/
+
+# Uploads (user-generated content)
+uploads/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
