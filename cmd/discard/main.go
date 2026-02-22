@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Stocist/discard/internal/database"
+	"github.com/Stocist/discard/internal/frontend"
 	"github.com/Stocist/discard/internal/server"
 	"github.com/Stocist/discard/internal/websocket"
 )
@@ -42,6 +43,13 @@ func main() {
 
 	srv := server.NewServer(db, hub)
 	srv.SetupRoutes()
+
+	// Serve embedded frontend with SPA fallback
+	frontendFS, err := frontend.FS()
+	if err != nil {
+		log.Fatalf("failed to load embedded frontend: %v", err)
+	}
+	srv.Router().Handle("/", frontend.SPAHandler(frontendFS))
 
 	addr := ":" + os.Getenv("PORT")
 	if addr == ":" {

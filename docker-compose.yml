@@ -1,27 +1,25 @@
 services:
-  app:
+  discard:
     build: .
     ports:
       - "4000:4000"
-    volumes:
-      - ./uploads:/app/uploads
     environment:
       - DATABASE_URL=postgres://discard:discard@postgres:5432/discard?sslmode=disable
-      - UPLOAD_DIR=/app/uploads
+      - UPLOAD_DIR=/data/uploads
+    volumes:
+      - uploads:/data/uploads
     depends_on:
       postgres:
         condition: service_healthy
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: discard
+      POSTGRES_PASSWORD: discard
+      POSTGRES_DB: discard
     volumes:
       - pgdata:/var/lib/postgresql/data
-    environment:
-      - POSTGRES_USER=discard
-      - POSTGRES_PASSWORD=discard
-      - POSTGRES_DB=discard
-    ports:
-      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U discard"]
       interval: 5s
@@ -30,3 +28,4 @@ services:
 
 volumes:
   pgdata:
+  uploads:

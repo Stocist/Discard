@@ -20,6 +20,10 @@ dist/
 build/
 web/build/
 
+# Embedded frontend build artifacts (keep placeholder)
+internal/frontend/build/
+!internal/frontend/build/index.html
+
 # Environment
 .env
 .env.*

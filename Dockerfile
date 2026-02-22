@@ -1,25 +1,24 @@
-# Stage 1: Build Go binary
-FROM golang:1.23-alpine AS builder-backend
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY cmd/ cmd/
-COPY internal/ internal/
-RUN CGO_ENABLED=0 go build -o /app/discard ./cmd/discard
-
-# Stage 2: Build SvelteKit frontend
-FROM node:22-alpine AS builder-frontend
-WORKDIR /src
-COPY web/package.json web/package-lock.json ./
+# Stage 1: Build frontend
+FROM node:22-alpine AS frontend
+WORKDIR /app/web
+COPY web/package*.json ./
 RUN npm ci
-COPY web/ .
+COPY web/ ./
 RUN npm run build
 
+# Stage 2: Build Go binary with embedded frontend
+FROM golang:1.25-alpine AS backend
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=frontend /app/web/build ./internal/frontend/build
+RUN CGO_ENABLED=0 go build -o discard ./cmd/discard
+
 # Stage 3: Minimal runtime
-FROM alpine:latest
+FROM alpine:3.20
 RUN apk add --no-cache ca-certificates ffmpeg yt-dlp
 WORKDIR /app
-COPY --from=builder-backend /app/discard /app/discard
-COPY --from=builder-frontend /src/build /app/web/build
+COPY --from=backend /app/discard /app/discard
 EXPOSE 4000
-ENTRYPOINT ["/app/discard"]
+CMD ["/app/discard"]
