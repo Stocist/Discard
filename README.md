@@ -15,12 +15,14 @@ Discard is a personalised chat platform — text, voice, video, streaming, and m
 
 ## Why not use existing self-hosted alternatives?
 
-| Alternative | Issue |
-|---|---|
-| **Revolt/Stoat** | Voice is broken, mid-migration, unstable |
-| **Spacebar** | Voice/video experimental, no UDP support |
-| **Matrix/Element** | Complex setup (Synapse + Element + Coturn + LiveKit), feels like Slack not Discord |
-| **Stryve / Wrongthink** | Abandoned or minimal features |
+
+| Alternative             | Issue                                                                              |
+| ----------------------- | ---------------------------------------------------------------------------------- |
+| **Revolt/Stoat**        | Voice is broken, mid-migration, unstable                                           |
+| **Spacebar**            | Voice/video experimental, no UDP support                                           |
+| **Matrix/Element**      | Complex setup (Synapse + Element + Coturn + LiveKit), feels like Slack not Discord |
+| **Stryve / Wrongthink** | Abandoned or minimal features                                                      |
+
 
 None of these are built for a **trusted private network**. Discard assumes Tailscale handles networking, encryption, and identity — which eliminates the hardest parts of building a chat platform.
 
@@ -34,16 +36,18 @@ None of these are built for a **trusted private network**. Discard assumes Tails
 
 ## Tech stack
 
-| Component | Technology |
-|---|---|
-| Backend | Go |
-| Database | PostgreSQL |
-| Real-time | WebSockets |
-| Voice/Video/Streaming | Pion WebRTC |
-| Music | ffmpeg + yt-dlp + Opus codec |
-| Frontend | SvelteKit (Svelte 5, TypeScript) |
-| File storage | Disk (WebP conversion for images) |
-| Networking | Tailscale (with optional fallback auth) |
+
+| Component             | Technology                              |
+| --------------------- | --------------------------------------- |
+| Backend               | Go                                      |
+| Database              | PostgreSQL                              |
+| Real-time             | WebSockets                              |
+| Voice/Video/Streaming | Pion WebRTC                             |
+| Music                 | ffmpeg + yt-dlp + Opus codec            |
+| Frontend              | SvelteKit (Svelte 5, TypeScript)        |
+| File storage          | Disk (WebP conversion for images)       |
+| Networking            | Tailscale (with optional fallback auth) |
+
 
 ## Target deployment
 
