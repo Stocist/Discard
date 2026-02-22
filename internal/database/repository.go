@@ -190,9 +190,11 @@ func (r *ServerMemberRepo) RemoveMember(ctx context.Context, userID, serverID uu
 
 func (r *ServerMemberRepo) ListMembers(ctx context.Context, serverID uuid.UUID) ([]models.ServerMember, error) {
 	rows, err := r.DB.QueryContext(ctx,
-		`SELECT user_id, server_id, nickname, joined_at
-		 FROM server_members WHERE server_id = $1
-		 ORDER BY joined_at`, serverID,
+		`SELECT sm.user_id, sm.server_id, sm.nickname, sm.joined_at, u.username
+		 FROM server_members sm
+		 JOIN users u ON u.id = sm.user_id
+		 WHERE sm.server_id = $1
+		 ORDER BY sm.joined_at`, serverID,
 	)
 	if err != nil {
 		return nil, err
@@ -202,7 +204,7 @@ func (r *ServerMemberRepo) ListMembers(ctx context.Context, serverID uuid.UUID) 
 	var members []models.ServerMember
 	for rows.Next() {
 		var m models.ServerMember
-		if err := rows.Scan(&m.UserID, &m.ServerID, &m.Nickname, &m.JoinedAt); err != nil {
+		if err := rows.Scan(&m.UserID, &m.ServerID, &m.Nickname, &m.JoinedAt, &m.Username); err != nil {
 			return nil, err
 		}
 		members = append(members, m)
@@ -380,6 +382,56 @@ func (r *MessageRepo) Create(ctx context.Context, m *models.Message) error {
 		m.ID, m.ChannelID, m.AuthorID, m.Content, m.Edited, m.CreatedAt, m.UpdatedAt,
 	).Scan(&m.AuthorUsername)
 	return err
+}
+
+func (r *MessageRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.Message, error) {
+	m := &models.Message{}
+	err := r.DB.QueryRowContext(ctx,
+		`SELECT m.id, m.channel_id, m.author_id, m.content, m.edited, m.created_at, m.updated_at, u.username
+		 FROM messages m
+		 JOIN users u ON u.id = m.author_id
+		 WHERE m.id = $1`, id,
+	).Scan(&m.ID, &m.ChannelID, &m.AuthorID, &m.Content, &m.Edited, &m.CreatedAt, &m.UpdatedAt, &m.AuthorUsername)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (r *MessageRepo) Update(ctx context.Context, messageID, authorID uuid.UUID, content string) (*models.Message, error) {
+	m := &models.Message{}
+	err := r.DB.QueryRowContext(ctx,
+		`WITH upd AS (
+			UPDATE messages SET content = $1, edited = true, updated_at = $2
+			WHERE id = $3 AND author_id = $4
+			RETURNING id, channel_id, author_id, content, edited, created_at, updated_at
+		)
+		SELECT upd.id, upd.channel_id, upd.author_id, upd.content, upd.edited, upd.created_at, upd.updated_at, u.username
+		FROM upd JOIN users u ON u.id = upd.author_id`,
+		content, time.Now(), messageID, authorID,
+	).Scan(&m.ID, &m.ChannelID, &m.AuthorID, &m.Content, &m.Edited, &m.CreatedAt, &m.UpdatedAt, &m.AuthorUsername)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (r *MessageRepo) Delete(ctx context.Context, messageID, authorID uuid.UUID) error {
+	result, err := r.DB.ExecContext(ctx,
+		`DELETE FROM messages WHERE id = $1 AND author_id = $2`,
+		messageID, authorID,
+	)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (r *MessageRepo) ListByChannel(ctx context.Context, channelID uuid.UUID, before *uuid.UUID, limit int) ([]models.Message, error) {

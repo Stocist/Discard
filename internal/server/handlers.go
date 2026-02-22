@@ -5,12 +5,15 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/Stocist/discard/internal/auth"
 	"github.com/Stocist/discard/internal/database"
 	"github.com/Stocist/discard/internal/models"
+	"github.com/Stocist/discard/internal/upload"
 	"github.com/google/uuid"
 )
 
@@ -557,6 +560,18 @@ func (s *Server) handleListFriends(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(friends)
 }
 
+// --- Presence ---
+
+func (s *Server) handlePresence(w http.ResponseWriter, r *http.Request) {
+	ids := s.hub.Presence().OnlineUserIDs()
+	strs := make([]string, len(ids))
+	for i, id := range ids {
+		strs[i] = id.String()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(strs)
+}
+
 // --- Messages ---
 
 func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
@@ -641,6 +656,247 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		messages = []models.Message{}
 	}
 
+	// Load attachments for each message.
+	attachmentRepo := &database.AttachmentRepo{DB: s.db}
+	for i := range messages {
+		atts, err := attachmentRepo.ListByMessage(r.Context(), messages[i].ID)
+		if err != nil {
+			log.Printf("failed to load attachments for message %s: %v", messages[i].ID, err)
+			continue
+		}
+		messages[i].Attachments = atts
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(messages)
+}
+
+// --- Create Message (multipart, with file uploads) ---
+
+func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	channelID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		jsonError(w, "invalid channel id", http.StatusBadRequest)
+		return
+	}
+
+	// Access check (same logic as handleListMessages).
+	channelRepo := &database.ChannelRepo{DB: s.db}
+	ch, err := channelRepo.GetChannelByID(r.Context(), channelID)
+	if err == sql.ErrNoRows {
+		jsonError(w, "channel not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, "failed to get channel", http.StatusInternalServerError)
+		return
+	}
+
+	if ch.ServerID != nil {
+		memberRepo := &database.ServerMemberRepo{DB: s.db}
+		isMember, err := memberRepo.IsMember(r.Context(), user.ID, *ch.ServerID)
+		if err != nil {
+			jsonError(w, "failed to check membership", http.StatusInternalServerError)
+			return
+		}
+		if !isMember {
+			jsonError(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	} else {
+		dmRepo := &database.DMMemberRepo{DB: s.db}
+		isMember, err := dmRepo.IsMember(r.Context(), channelID, user.ID)
+		if err != nil {
+			jsonError(w, "failed to check DM membership", http.StatusInternalServerError)
+			return
+		}
+		if !isMember {
+			jsonError(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
+	// Parse multipart form — 10 MB max memory.
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		jsonError(w, "invalid multipart form", http.StatusBadRequest)
+		return
+	}
+
+	content := r.FormValue("content")
+	files := r.MultipartForm.File["files"]
+
+	if content == "" && len(files) == 0 {
+		jsonError(w, "message must have content or attachments", http.StatusBadRequest)
+		return
+	}
+	if len(content) > 4000 {
+		jsonError(w, "message content must be 4000 characters or less", http.StatusBadRequest)
+		return
+	}
+
+	// Create the message.
+	msg := &models.Message{
+		ChannelID: channelID,
+		AuthorID:  user.ID,
+		Content:   content,
+	}
+	msgRepo := &database.MessageRepo{DB: s.db}
+	if err := msgRepo.Create(r.Context(), msg); err != nil {
+		jsonError(w, "failed to create message", http.StatusInternalServerError)
+		return
+	}
+
+	// Process file uploads.
+	attachmentRepo := &database.AttachmentRepo{DB: s.db}
+	var attachments []models.Attachment
+
+	for _, fh := range files {
+		result, err := upload.ProcessFile(s.uploadDir, fh)
+		if err != nil {
+			log.Printf("upload error for %q: %v", fh.Filename, err)
+			continue
+		}
+
+		att := models.Attachment{
+			MessageID:    msg.ID,
+			FilePath:     result.FilePath,
+			OriginalName: result.OriginalName,
+			MimeType:     &result.MimeType,
+			FileSize:     &result.FileSize,
+			Width:        result.Width,
+			Height:       result.Height,
+		}
+		if err := attachmentRepo.Create(r.Context(), &att); err != nil {
+			log.Printf("attachment db error for %q: %v", fh.Filename, err)
+			continue
+		}
+		attachments = append(attachments, att)
+	}
+
+	msg.Attachments = attachments
+
+	// Broadcast via WebSocket so other clients see it in real-time.
+	out, err := json.Marshal(map[string]any{
+		"type":    "message",
+		"message": msg,
+	})
+	if err == nil {
+		s.hub.BroadcastToChannel(channelID, out)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(msg)
+}
+
+// --- Edit / Delete Messages ---
+
+func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	messageID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		jsonError(w, "invalid message id", http.StatusBadRequest)
+		return
+	}
+
+	var input struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	input.Content = strings.TrimSpace(input.Content)
+	if input.Content == "" {
+		jsonError(w, "content is required", http.StatusBadRequest)
+		return
+	}
+	if len(input.Content) > 4000 {
+		jsonError(w, "message content must be 4000 characters or less", http.StatusBadRequest)
+		return
+	}
+
+	msgRepo := &database.MessageRepo{DB: s.db}
+	updated, err := msgRepo.Update(r.Context(), messageID, user.ID, input.Content)
+	if err == sql.ErrNoRows {
+		jsonError(w, "message not found or not yours", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, "failed to update message", http.StatusInternalServerError)
+		return
+	}
+
+	// Broadcast edit via WebSocket.
+	out, err := json.Marshal(map[string]any{
+		"type":    "message_edit",
+		"message": updated,
+	})
+	if err == nil {
+		s.hub.BroadcastToChannel(updated.ChannelID, out)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updated)
+}
+
+func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	messageID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		jsonError(w, "invalid message id", http.StatusBadRequest)
+		return
+	}
+
+	msgRepo := &database.MessageRepo{DB: s.db}
+
+	// Look up the message to get channel_id for WS broadcast.
+	msg, err := msgRepo.GetByID(r.Context(), messageID)
+	if err == sql.ErrNoRows {
+		jsonError(w, "message not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, "failed to get message", http.StatusInternalServerError)
+		return
+	}
+
+	// Only the author can delete their own message.
+	if msg.AuthorID != user.ID {
+		jsonError(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if err := msgRepo.Delete(r.Context(), messageID, user.ID); err != nil {
+		jsonError(w, "failed to delete message", http.StatusInternalServerError)
+		return
+	}
+
+	// Broadcast delete via WebSocket.
+	out, err := json.Marshal(map[string]any{
+		"type":       "message_delete",
+		"channel_id": msg.ChannelID.String(),
+		"message_id": messageID.String(),
+	})
+	if err == nil {
+		s.hub.BroadcastToChannel(msg.ChannelID, out)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }

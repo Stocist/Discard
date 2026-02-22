@@ -38,9 +38,9 @@
 
 <ChannelSidebar
 	{serverId}
-	{channels}
+	bind:channels
 	{serverName}
-	memberCount={members.length}
+	{members}
 />
 
 {#if channelId}

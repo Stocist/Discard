@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/google/uuid"
 	gorillaWs "github.com/gorilla/websocket"
@@ -23,16 +24,22 @@ var upgrader = gorillaWs.Upgrader{
 }
 
 type Server struct {
-	db     *sql.DB
-	hub    *ws.Hub
-	router *http.ServeMux
+	db        *sql.DB
+	hub       *ws.Hub
+	router    *http.ServeMux
+	uploadDir string
 }
 
 func NewServer(db *sql.DB, hub *ws.Hub) *Server {
+	uploadDir := os.Getenv("UPLOAD_DIR")
+	if uploadDir == "" {
+		uploadDir = "./uploads"
+	}
 	return &Server{
-		db:     db,
-		hub:    hub,
-		router: http.NewServeMux(),
+		db:        db,
+		hub:       hub,
+		router:    http.NewServeMux(),
+		uploadDir: uploadDir,
 	}
 }
 
@@ -73,6 +80,15 @@ func (s *Server) SetupRoutes() {
 
 	// Messages
 	a("GET /api/channels/{id}/messages", s.handleListMessages)
+	a("POST /api/channels/{id}/messages", s.handleCreateMessage)
+	a("PUT /api/messages/{id}", s.handleEditMessage)
+	a("DELETE /api/messages/{id}", s.handleDeleteMessage)
+
+	// Uploads — static file server
+	s.router.Handle("GET /uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(s.uploadDir))))
+
+	// Presence
+	a("GET /api/presence", s.handlePresence)
 
 	// WebSocket
 	a("GET /api/ws", s.handleWebSocket)
