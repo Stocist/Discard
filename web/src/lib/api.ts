@@ -87,6 +87,44 @@ export function listMessages(
 	return apiFetch(`/channels/${channelId}/messages${qs ? `?${qs}` : ''}`);
 }
 
+// Create message (multipart — supports file attachments)
+export async function createMessage(
+	channelId: string,
+	content: string,
+	files?: File[]
+): Promise<Message> {
+	const form = new FormData();
+	form.append('content', content);
+	if (files) {
+		for (const file of files) {
+			form.append('files', file);
+		}
+	}
+	// Do NOT use apiFetch here — it sets Content-Type to application/json.
+	// For multipart/form-data the browser must set the boundary automatically.
+	const res = await fetch(`/api/channels/${channelId}/messages`, {
+		method: 'POST',
+		body: form
+	});
+	if (!res.ok) {
+		const text = await res.text().catch(() => res.statusText);
+		throw new ApiError(res.status, text);
+	}
+	return res.json();
+}
+
+// Edit / Delete messages
+export function editMessage(messageId: string, content: string): Promise<Message> {
+	return apiFetch(`/messages/${messageId}`, {
+		method: 'PUT',
+		body: JSON.stringify({ content })
+	});
+}
+
+export function deleteMessage(messageId: string): Promise<void> {
+	return apiFetch(`/messages/${messageId}`, { method: 'DELETE' });
+}
+
 // Friends
 export function sendFriendRequest(username: string): Promise<Friendship> {
 	return apiFetch('/friends/requests', {

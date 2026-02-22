@@ -28,6 +28,18 @@ export interface Channel {
 	created_at: string;
 }
 
+export interface Attachment {
+	id: string;
+	message_id: string;
+	file_path: string;
+	original_name: string;
+	mime_type: string | null;
+	file_size: number | null;
+	width: number | null;
+	height: number | null;
+	created_at: string;
+}
+
 export interface Message {
 	id: string;
 	channel_id: string;
@@ -37,6 +49,7 @@ export interface Message {
 	created_at: string;
 	updated_at: string;
 	author_username?: string;
+	attachments?: Attachment[];
 }
 
 export interface ServerMember {
@@ -44,6 +57,7 @@ export interface ServerMember {
 	server_id: string;
 	nickname: string | null;
 	joined_at: string;
+	username?: string;
 }
 
 export interface Friendship {
@@ -60,4 +74,26 @@ export interface Friendship {
 export interface WSMessage {
 	type: 'message';
 	message: Message;
+}
+
+export interface WSMessageEdit {
+	type: 'message_edit';
+	message: Message;
+}
+
+export interface WSMessageDelete {
+	type: 'message_delete';
+	channel_id: string;
+	message_id: string;
+}
+
+export interface WSPresenceUpdate {
+	type: 'presence_update';
+	user_id: string;
+	status: 'online' | 'offline';
+}
+
+export interface WSPresenceList {
+	type: 'presence_list';
+	user_ids: string[];
 }
