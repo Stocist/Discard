@@ -1,14 +1,16 @@
 :root {
-	--bg-primary: #313338;
-	--bg-sidebar: #2b2d31;
-	--bg-server-bar: #1e1f22;
-	--bg-input: #383a40;
-	--bg-hover: #35373c;
-	--text-primary: #dbdee1;
-	--text-muted: #949ba4;
-	--accent: #5865f2;
-	--accent-hover: #4752c4;
-	--border: #1e1f22;
+	--bg-primary: #1c1917;
+	--bg-secondary: #292524;
+	--bg-tertiary: #44403c;
+	--bg-sidebar: #292524;
+	--bg-server-bar: #1c1917;
+	--bg-input: #44403c;
+	--bg-hover: #44403c;
+	--text-primary: #e7e5e4;
+	--text-muted: #a8a29e;
+	--accent: #84cc16;
+	--accent-hover: #a3e635;
+	--border: #57534e;
 	--font: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 
@@ -62,10 +64,76 @@ ul, ol {
 }
 
 ::-webkit-scrollbar-track {
-	background: transparent;
+	background: var(--bg-primary);
 }
 
 ::-webkit-scrollbar-thumb {
-	background: var(--bg-server-bar);
+	background: var(--bg-tertiary);
 	border-radius: 4px;
+}
+
+::selection {
+	background: rgba(132, 204, 22, 0.3);
+}
+
+/* Markdown styles */
+.message-content p {
+	margin: 0;
+}
+
+.message-content p + p {
+	margin-top: 4px;
+}
+
+.message-content code {
+	background: #44403c;
+	padding: 1px 5px;
+	border-radius: 3px;
+	font-family: 'SF Mono', 'Fira Code', 'Fira Mono', Menlo, monospace;
+	font-size: 0.9em;
+}
+
+.message-content pre {
+	background: #1c1917;
+	padding: 10px 12px;
+	border-radius: 6px;
+	overflow-x: auto;
+	margin: 4px 0;
+	border: 1px solid var(--border);
+}
+
+.message-content pre code {
+	background: none;
+	padding: 0;
+	border-radius: 0;
+	font-size: 0.85em;
+}
+
+.message-content a {
+	color: var(--accent);
+	text-decoration: none;
+}
+
+.message-content a:hover {
+	text-decoration: underline;
+}
+
+.message-content blockquote {
+	border-left: 3px solid var(--accent);
+	padding-left: 10px;
+	color: var(--text-muted);
+	margin: 4px 0;
+}
+
+.message-content ul,
+.message-content ol {
+	list-style: revert;
+	padding-left: 24px;
+	margin: 4px 0;
+}
+
+.message-content strong,
+.message-content em,
+.message-content del {
+	color: inherit;
 }

@@ -126,11 +126,11 @@
 
 	.add-btn {
 		font-size: 24px;
-		color: #3ba55d;
+		color: var(--accent);
 	}
 
 	.add-btn:hover {
-		background: #3ba55d;
+		background: var(--accent);
 		color: white;
 		border-radius: 16px;
 	}
