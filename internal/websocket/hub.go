@@ -1,51 +1,133 @@
 package websocket
 
-import "net"
+import (
+	"sync"
 
-// Client represents a connected WebSocket client.
-type Client struct {
-	Conn net.Conn
-	Send chan []byte
-}
+	"github.com/google/uuid"
+)
 
-// Hub maintains the set of active clients and broadcasts messages.
+// Hub maintains channel-scoped client subscriptions and broadcasts messages
+// to subscribers of specific channels.
 type Hub struct {
-	Clients    map[*Client]bool
-	Register   chan *Client
-	Unregister chan *Client
-	Broadcast  chan []byte
+	// channels maps channelID -> set of subscribed clients
+	channels map[uuid.UUID]map[*Client]struct{}
+
+	register   chan *Client
+	unregister chan *Client
+
+	subscribe   chan subscribeRequest
+	unsubscribe chan subscribeRequest
+
+	broadcast chan broadcastRequest
+
+	mu sync.RWMutex
 }
 
-// NewHub creates a new Hub.
+type subscribeRequest struct {
+	client    *Client
+	channelID uuid.UUID
+}
+
+type broadcastRequest struct {
+	channelID uuid.UUID
+	data      []byte
+}
+
 func NewHub() *Hub {
 	return &Hub{
-		Clients:    make(map[*Client]bool),
-		Register:   make(chan *Client),
-		Unregister: make(chan *Client),
-		Broadcast:  make(chan []byte),
+		channels:    make(map[uuid.UUID]map[*Client]struct{}),
+		register:    make(chan *Client),
+		unregister:  make(chan *Client),
+		subscribe:   make(chan subscribeRequest),
+		unsubscribe: make(chan subscribeRequest),
+		broadcast:   make(chan broadcastRequest, 256),
 	}
 }
 
-// Run starts the hub's event loop.
+// Run starts the hub event loop. Should be called in its own goroutine.
 func (h *Hub) Run() {
 	for {
 		select {
-		case client := <-h.Register:
-			h.Clients[client] = true
-		case client := <-h.Unregister:
-			if _, ok := h.Clients[client]; ok {
-				delete(h.Clients, client)
-				close(client.Send)
+		case client := <-h.register:
+			h.mu.Lock()
+			client.hub = h
+			h.mu.Unlock()
+
+		case client := <-h.unregister:
+			h.mu.Lock()
+			h.removeClientLocked(client)
+			h.mu.Unlock()
+
+		case req := <-h.subscribe:
+			h.mu.Lock()
+			subs, ok := h.channels[req.channelID]
+			if !ok {
+				subs = make(map[*Client]struct{})
+				h.channels[req.channelID] = subs
 			}
-		case message := <-h.Broadcast:
-			for client := range h.Clients {
-				select {
-				case client.Send <- message:
-				default:
-					close(client.Send)
-					delete(h.Clients, client)
+			subs[req.client] = struct{}{}
+			h.mu.Unlock()
+
+		case req := <-h.unsubscribe:
+			h.mu.Lock()
+			if subs, ok := h.channels[req.channelID]; ok {
+				delete(subs, req.client)
+				if len(subs) == 0 {
+					delete(h.channels, req.channelID)
 				}
 			}
+			h.mu.Unlock()
+
+		case req := <-h.broadcast:
+			h.mu.RLock()
+			subs := h.channels[req.channelID]
+			for client := range subs {
+				select {
+				case client.send <- req.data:
+				default:
+					// slow client — drop and clean up
+					go func(c *Client) {
+						h.unregister <- c
+					}(client)
+				}
+			}
+			h.mu.RUnlock()
 		}
 	}
+}
+
+// Subscribe adds a client to a channel's subscriber set.
+func (h *Hub) Subscribe(client *Client, channelID uuid.UUID) {
+	h.subscribe <- subscribeRequest{client: client, channelID: channelID}
+}
+
+// Unsubscribe removes a client from a channel's subscriber set.
+func (h *Hub) Unsubscribe(client *Client, channelID uuid.UUID) {
+	h.unsubscribe <- subscribeRequest{client: client, channelID: channelID}
+}
+
+// UnsubscribeAll removes a client from every channel and closes its send buffer.
+func (h *Hub) UnsubscribeAll(client *Client) {
+	h.unregister <- client
+}
+
+// BroadcastToChannel sends data to all clients subscribed to the given channel.
+func (h *Hub) BroadcastToChannel(channelID uuid.UUID, data []byte) {
+	h.broadcast <- broadcastRequest{channelID: channelID, data: data}
+}
+
+// Register adds a client to the hub.
+func (h *Hub) Register(client *Client) {
+	h.register <- client
+}
+
+// removeClientLocked removes a client from all channels. Caller must hold h.mu write lock.
+func (h *Hub) removeClientLocked(client *Client) {
+	for chID, subs := range h.channels {
+		delete(subs, client)
+		if len(subs) == 0 {
+			delete(h.channels, chID)
+		}
+	}
+	client.CloseSend()
 }
