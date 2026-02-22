@@ -1,6 +1,8 @@
 package websocket
 
 import (
+	"encoding/json"
+	"log"
 	"sync"
 
 	"github.com/google/uuid"
@@ -11,6 +13,11 @@ import (
 type Hub struct {
 	// channels maps channelID -> set of subscribed clients
 	channels map[uuid.UUID]map[*Client]struct{}
+
+	// allClients tracks every connected client for global broadcasts (e.g. presence).
+	allClients map[*Client]struct{}
+
+	presence *PresenceTracker
 
 	register   chan *Client
 	unregister chan *Client
@@ -36,12 +43,19 @@ type broadcastRequest struct {
 func NewHub() *Hub {
 	return &Hub{
 		channels:    make(map[uuid.UUID]map[*Client]struct{}),
+		allClients:  make(map[*Client]struct{}),
+		presence:    NewPresenceTracker(),
 		register:    make(chan *Client),
 		unregister:  make(chan *Client),
 		subscribe:   make(chan subscribeRequest),
 		unsubscribe: make(chan subscribeRequest),
 		broadcast:   make(chan broadcastRequest, 256),
 	}
+}
+
+// Presence returns the hub's presence tracker (used by REST handlers).
+func (h *Hub) Presence() *PresenceTracker {
+	return h.presence
 }
 
 // Run starts the hub event loop. Should be called in its own goroutine.
@@ -51,12 +65,20 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			client.hub = h
+			h.allClients[client] = struct{}{}
 			h.mu.Unlock()
+			if h.presence.SetOnline(client.UserID, client) {
+				h.broadcastPresence(client.UserID, "online")
+			}
 
 		case client := <-h.unregister:
 			h.mu.Lock()
 			h.removeClientLocked(client)
+			delete(h.allClients, client)
 			h.mu.Unlock()
+			if h.presence.SetOffline(client.UserID, client) {
+				h.broadcastPresence(client.UserID, "offline")
+			}
 
 		case req := <-h.subscribe:
 			h.mu.Lock()
@@ -119,6 +141,35 @@ func (h *Hub) BroadcastToChannel(channelID uuid.UUID, data []byte) {
 // Register adds a client to the hub.
 func (h *Hub) Register(client *Client) {
 	h.register <- client
+}
+
+// broadcastPresence sends a presence_update to all connected clients.
+func (h *Hub) broadcastPresence(userID uuid.UUID, status string) {
+	data, err := json.Marshal(map[string]string{
+		"type":    "presence_update",
+		"user_id": userID.String(),
+		"status":  status,
+	})
+	if err != nil {
+		log.Printf("presence marshal error: %v", err)
+		return
+	}
+	h.mu.RLock()
+	for client := range h.allClients {
+		select {
+		case client.send <- data:
+		default:
+		}
+	}
+	h.mu.RUnlock()
+}
+
+// SendToClient sends raw JSON data to a single client.
+func (h *Hub) SendToClient(client *Client, data []byte) {
+	select {
+	case client.send <- data:
+	default:
+	}
 }
 
 // removeClientLocked removes a client from all channels. Caller must hold h.mu write lock.

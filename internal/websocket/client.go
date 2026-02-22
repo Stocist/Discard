@@ -62,9 +62,9 @@ func NewClient(conn *websocket.Conn, userID uuid.UUID, handler MessageHandler, c
 
 // incomingMessage is the envelope for messages from the browser.
 type incomingMessage struct {
-	Type      string    `json:"type"`
-	ChannelID uuid.UUID `json:"channel_id"`
-	Content   string    `json:"content,omitempty"`
+	Type      string `json:"type"`
+	ChannelID string `json:"channel_id,omitempty"`
+	Content   string `json:"content,omitempty"`
 }
 
 // outgoingMessage is the envelope for messages sent to the browser.
@@ -105,8 +105,13 @@ func (c *Client) ReadPump() {
 
 		switch msg.Type {
 		case "subscribe":
+			channelID, err := uuid.Parse(msg.ChannelID)
+			if err != nil {
+				c.sendError("invalid channel_id")
+				continue
+			}
 			if c.CheckMembership != nil {
-				ok, err := c.CheckMembership(context.Background(), c.UserID, msg.ChannelID)
+				ok, err := c.CheckMembership(context.Background(), c.UserID, channelID)
 				if err != nil {
 					log.Printf("ws membership check error: %v", err)
 					c.sendError("failed to verify channel membership")
@@ -117,13 +122,20 @@ func (c *Client) ReadPump() {
 					continue
 				}
 			}
-			c.hub.Subscribe(c, msg.ChannelID)
+			c.hub.Subscribe(c, channelID)
 
 		case "unsubscribe":
-			c.hub.Unsubscribe(c, msg.ChannelID)
+			channelID, err := uuid.Parse(msg.ChannelID)
+			if err != nil {
+				continue
+			}
+			c.hub.Unsubscribe(c, channelID)
 
 		case "message":
 			c.handleChatMessage(msg)
+
+		case "presence_request":
+			c.handlePresenceRequest()
 
 		default:
 			log.Printf("ws unknown message type: %s", msg.Type)
@@ -175,6 +187,23 @@ func (c *Client) sendError(message string) {
 	}
 }
 
+func (c *Client) handlePresenceRequest() {
+	ids := c.hub.presence.OnlineUserIDs()
+	strs := make([]string, len(ids))
+	for i, id := range ids {
+		strs[i] = id.String()
+	}
+	data, err := json.Marshal(map[string]interface{}{
+		"type":     "presence_list",
+		"user_ids": strs,
+	})
+	if err != nil {
+		log.Printf("presence list marshal error: %v", err)
+		return
+	}
+	c.hub.SendToClient(c, data)
+}
+
 func (c *Client) handleChatMessage(msg incomingMessage) {
 	if msg.Content == "" || c.OnMessage == nil {
 		return
@@ -183,8 +212,13 @@ func (c *Client) handleChatMessage(msg incomingMessage) {
 		log.Printf("ws message too long from user %s: %d chars", c.UserID, len(msg.Content))
 		return
 	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		c.sendError("invalid channel_id")
+		return
+	}
 
-	saved, err := c.OnMessage(context.Background(), msg.ChannelID, c.UserID, msg.Content)
+	saved, err := c.OnMessage(context.Background(), channelID, c.UserID, msg.Content)
 	if err != nil {
 		log.Printf("ws message handler error: %v", err)
 		return
@@ -199,5 +233,5 @@ func (c *Client) handleChatMessage(msg incomingMessage) {
 		return
 	}
 
-	c.hub.BroadcastToChannel(msg.ChannelID, out)
+	c.hub.BroadcastToChannel(channelID, out)
 }
