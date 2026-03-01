@@ -49,6 +49,8 @@ export interface Message {
 	created_at: string;
 	updated_at: string;
 	author_username?: string;
+	author_display_name?: string | null;
+	author_avatar_url?: string | null;
 	attachments?: Attachment[];
 }
 
@@ -58,6 +60,8 @@ export interface ServerMember {
 	nickname: string | null;
 	joined_at: string;
 	username?: string;
+	display_name?: string | null;
+	avatar_url?: string | null;
 }
 
 export interface Friendship {
@@ -96,4 +100,14 @@ export interface WSPresenceUpdate {
 export interface WSPresenceList {
 	type: 'presence_list';
 	user_ids: string[];
+}
+
+export interface WSServerUpdate {
+	type: 'server_update';
+	server: Server;
+}
+
+export interface WSServerDelete {
+	type: 'server_delete';
+	server_id: string;
 }

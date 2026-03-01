@@ -1,28 +1,39 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import type { Channel, ServerMember } from '$lib/types';
-	import { createChannel } from '$lib/api';
-	import { isUserOnline, subscribePresence } from '$lib/ws';
+	import type { Channel, Server, User } from '$lib/types';
+	import { createChannel, updateChannel, deleteChannel } from '$lib/api';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
+	import ServerSettings from './ServerSettings.svelte';
+	import ContextMenu from './ContextMenu.svelte';
+	import UserProfile from './UserProfile.svelte';
 
-	let { serverId, channels = $bindable(), serverName, members = [] }: {
+	let { serverId, channels = $bindable(), serverName = $bindable(), server = $bindable(), isOwner = false, onserverdelete, unreadCounts = {}, currentUser = $bindable() }: {
 		serverId: string;
 		channels: Channel[];
 		serverName: string;
-		members?: ServerMember[];
+		server?: Server;
+		isOwner?: boolean;
+		onserverdelete?: () => void;
+		unreadCounts?: Record<string, number>;
+		currentUser?: User | null;
 	} = $props();
+
+	let showSettings = $state(false);
+	let showProfile = $state(false);
 
 	const currentChannelId = $derived(page.params?.channelId ?? '');
 
-	// Force re-render when presence changes
-	let presenceTick = $state(0);
-	onMount(() => subscribePresence(() => { presenceTick++; }));
-
-	function checkOnline(userId: string): boolean {
-		void presenceTick;
-		return isUserOnline(userId);
-	}
+	// Open settings modal when ?settings=1 is in the URL (from ServerSidebar context menu)
+	$effect(() => {
+		const url = page.url;
+		if (url.searchParams.get('settings') === '1' && server && isOwner) {
+			showSettings = true;
+			// Remove the query param without triggering navigation
+			const clean = new URL(url);
+			clean.searchParams.delete('settings');
+			history.replaceState({}, '', clean.pathname + clean.search);
+		}
+	});
 
 	// Channel creation
 	let showNewChannel = $state(false);
@@ -53,11 +64,112 @@
 			newChannelName = '';
 		}
 	}
+
+	// Channel deletion
+	let confirmDeleteId = $state<string | null>(null);
+	let deletingChannel = $state(false);
+
+	async function handleDeleteChannel(channelId: string) {
+		if (deletingChannel) return;
+		deletingChannel = true;
+		try {
+			await deleteChannel(serverId, channelId);
+			channels = channels.filter(c => c.id !== channelId);
+			confirmDeleteId = null;
+			// Navigate away if the deleted channel was active.
+			if (currentChannelId === channelId) {
+				const first = channels[0];
+				if (first) {
+					goto(`/servers/${serverId}/channels/${first.id}`);
+				} else {
+					goto(`/servers/${serverId}`);
+				}
+			}
+		} catch (e) {
+			console.error('Failed to delete channel:', e);
+		} finally {
+			deletingChannel = false;
+		}
+	}
+
+	// Channel rename
+	let editingChannelId = $state<string | null>(null);
+	let editChannelName = $state('');
+	let savingChannelName = $state(false);
+
+	function startRenameChannel(chId: string) {
+		const ch = channels.find(c => c.id === chId);
+		editingChannelId = chId;
+		editChannelName = ch?.name ?? '';
+	}
+
+	async function handleRenameChannel() {
+		if (!editingChannelId || savingChannelName) return;
+		const trimmed = editChannelName.trim();
+		if (!trimmed) { editingChannelId = null; return; }
+		const ch = channels.find(c => c.id === editingChannelId);
+		if (ch && trimmed === ch.name) { editingChannelId = null; return; }
+		savingChannelName = true;
+		try {
+			const updated = await updateChannel(serverId, editingChannelId, trimmed);
+			channels = channels.map(c => c.id === updated.id ? updated : c);
+			editingChannelId = null;
+		} catch (e) {
+			console.error('Failed to rename channel:', e);
+		} finally {
+			savingChannelName = false;
+		}
+	}
+
+	function handleRenameKeydown(e: KeyboardEvent) {
+		if (e.key === 'Enter') handleRenameChannel();
+		if (e.key === 'Escape') { editingChannelId = null; }
+	}
+
+	// Channel context menu
+	let channelCtx = $state<{ x: number; y: number; channelId: string } | null>(null);
+
+	function handleGlobalKeydown(e: KeyboardEvent) {
+		if (e.key === 'Escape') {
+			if (confirmDeleteId) { confirmDeleteId = null; return; }
+			if (editingChannelId) { editingChannelId = null; return; }
+			if (showNewChannel) { showNewChannel = false; newChannelName = ''; return; }
+		}
+	}
+
+	function handleChannelContextMenu(e: MouseEvent, channelId: string) {
+		e.preventDefault();
+		channelCtx = { x: e.clientX, y: e.clientY, channelId };
+	}
+
+	function channelContextItems(chId: string) {
+		const items: { label: string; action: () => void; danger?: boolean }[] = [
+			{ label: 'Copy Channel ID', action: () => navigator.clipboard.writeText(chId) },
+		];
+		if (isOwner) {
+			items.push({ label: 'Edit Channel', action: () => startRenameChannel(chId) });
+			items.push({ label: 'Delete Channel', action: () => { confirmDeleteId = chId; }, danger: true });
+		}
+		return items;
+	}
 </script>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 <aside class="channel-sidebar">
 	<div class="server-header">
 		<h2>{serverName}</h2>
+		{#if isOwner}
+			<button
+				class="settings-btn"
+				title="Server Settings"
+				onclick={() => (showSettings = true)}
+			>
+				<svg width="16" height="16" viewBox="0 0 20 20" fill="currentColor">
+					<path fill-rule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd"/>
+				</svg>
+			</button>
+		{/if}
 	</div>
 
 	<div class="channels">
@@ -83,30 +195,116 @@
 			</div>
 		{/if}
 		{#each channels as channel (channel.id)}
-			<button
-				class="channel"
-				class:active={currentChannelId === channel.id}
-				onclick={() => goto(`/servers/${serverId}/channels/${channel.id}`)}
-			>
-				<span class="hash">#</span>
-				<span class="channel-name">{channel.name ?? 'unnamed'}</span>
-			</button>
-		{/each}
-	</div>
-
-	<div class="member-list">
-		<div class="category-label">MEMBERS — {members.length}</div>
-		{#each members as member (member.user_id)}
-			<div class="member">
-				<span
-					class="presence-dot"
-					class:online={checkOnline(member.user_id)}
-				></span>
-				<span class="member-name">{member.nickname ?? member.username ?? member.user_id.slice(0, 8)}</span>
+			{@const unread = unreadCounts[channel.id] ?? 0}
+			<div class="channel-row">
+				<button
+					class="channel"
+					class:active={currentChannelId === channel.id}
+					class:unread={unread > 0 && currentChannelId !== channel.id}
+					onclick={() => goto(`/servers/${serverId}/channels/${channel.id}`)}
+					oncontextmenu={(e) => handleChannelContextMenu(e, channel.id)}
+				>
+					<span class="hash">#</span>
+					<span class="channel-name">{channel.name ?? 'unnamed'}</span>
+					{#if unread > 0 && currentChannelId !== channel.id}
+						<span class="unread-badge">{unread > 99 ? '99+' : unread}</span>
+					{/if}
+				</button>
+				<button
+					class="delete-channel-btn"
+					title="Delete Channel"
+					onclick={(e) => { e.stopPropagation(); confirmDeleteId = channel.id; }}
+				>&times;</button>
 			</div>
 		{/each}
 	</div>
+
+	{#if currentUser}
+		<button class="user-panel" onclick={() => (showProfile = true)}>
+			<div class="user-panel-avatar-wrapper">
+				{#if currentUser.avatar_path}
+					<img class="user-panel-avatar" src="/uploads/{currentUser.avatar_path}" alt="" />
+				{:else}
+					<span class="user-panel-avatar user-panel-avatar-fallback">{(currentUser.username ?? '?').charAt(0).toUpperCase()}</span>
+				{/if}
+				<span class="user-panel-presence"></span>
+			</div>
+			<span class="user-panel-name">{currentUser.display_name ?? currentUser.username}</span>
+		</button>
+	{/if}
 </aside>
+
+{#if editingChannelId}
+	<!-- svelte-ignore a11y_click_events_have_key_events -->
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="modal-overlay" onclick={() => { editingChannelId = null; }}>
+		<div class="modal-dialog" onclick={(e) => e.stopPropagation()}>
+			<h3>Edit Channel</h3>
+			<input
+				type="text"
+				class="rename-input"
+				maxlength="100"
+				bind:value={editChannelName}
+				onkeydown={handleRenameKeydown}
+				disabled={savingChannelName}
+			/>
+			<div class="modal-actions">
+				<button class="btn-cancel" onclick={() => { editingChannelId = null; }}>Cancel</button>
+				<button
+					class="btn-save"
+					disabled={savingChannelName || !editChannelName.trim()}
+					onclick={handleRenameChannel}
+				>{savingChannelName ? 'Saving...' : 'Save'}</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
+{#if confirmDeleteId}
+	{@const channelToDelete = channels.find(c => c.id === confirmDeleteId)}
+	<!-- svelte-ignore a11y_click_events_have_key_events -->
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="modal-overlay" onclick={() => { confirmDeleteId = null; }}>
+		<div class="modal-dialog" onclick={(e) => e.stopPropagation()}>
+			<h3>Delete Channel</h3>
+			<p>Are you sure you want to delete <strong>#{channelToDelete?.name ?? 'this channel'}</strong>? All messages will be permanently removed.</p>
+			<div class="modal-actions">
+				<button class="btn-cancel" onclick={() => { confirmDeleteId = null; }}>Cancel</button>
+				<button
+					class="btn-danger"
+					disabled={deletingChannel}
+					onclick={() => handleDeleteChannel(confirmDeleteId!)}
+				>{deletingChannel ? 'Deleting...' : 'Delete'}</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
+{#if showSettings && server}
+	<ServerSettings
+		{server}
+		onclose={() => (showSettings = false)}
+		ondelete={() => { showSettings = false; if (onserverdelete) onserverdelete(); }}
+		onsave={(updated) => { server = updated; serverName = updated.name; }}
+	/>
+{/if}
+
+{#if channelCtx}
+	<ContextMenu
+		x={channelCtx.x}
+		y={channelCtx.y}
+		items={channelContextItems(channelCtx.channelId)}
+		onClose={() => (channelCtx = null)}
+	/>
+{/if}
+
+{#if showProfile && currentUser}
+	<UserProfile
+		user={currentUser}
+		onclose={() => (showProfile = false)}
+		onsave={(updated) => { currentUser = updated; }}
+	/>
+{/if}
 
 <style>
 	.channel-sidebar {
@@ -124,6 +322,8 @@
 		min-height: 48px;
 		display: flex;
 		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
 	}
 
 	.server-header h2 {
@@ -132,6 +332,21 @@
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
+	}
+
+	.settings-btn {
+		flex-shrink: 0;
+		color: var(--text-muted);
+		padding: 4px;
+		border-radius: 4px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.settings-btn:hover {
+		color: var(--text-primary);
+		background: var(--bg-hover);
 	}
 
 	.channels {
@@ -193,6 +408,18 @@
 		color: var(--text-muted);
 	}
 
+	.channel-row {
+		display: flex;
+		align-items: center;
+		margin: 1px 8px;
+		border-radius: 4px;
+		position: relative;
+	}
+
+	.channel-row:hover .delete-channel-btn {
+		opacity: 1;
+	}
+
 	.channel {
 		display: flex;
 		align-items: center;
@@ -200,9 +427,25 @@
 		width: 100%;
 		padding: 6px 12px;
 		border-radius: 4px;
-		margin: 1px 8px;
-		width: calc(100% - 16px);
 		color: var(--text-muted);
+	}
+
+	.channel.unread {
+		color: var(--text-primary);
+		font-weight: 600;
+	}
+
+	.unread-badge {
+		margin-left: auto;
+		background: var(--accent);
+		color: #1c1917;
+		font-size: 11px;
+		font-weight: 700;
+		padding: 1px 5px;
+		border-radius: 8px;
+		min-width: 18px;
+		text-align: center;
+		line-height: 16px;
 	}
 
 	.channel:hover {
@@ -213,6 +456,23 @@
 	.channel.active {
 		background: var(--bg-hover);
 		color: white;
+	}
+
+	.delete-channel-btn {
+		position: absolute;
+		right: 4px;
+		opacity: 0;
+		font-size: 14px;
+		color: var(--text-muted);
+		padding: 2px 6px;
+		border-radius: 3px;
+		cursor: pointer;
+		transition: opacity 0.1s;
+	}
+
+	.delete-channel-btn:hover {
+		color: #ef4444;
+		background: var(--bg-primary);
 	}
 
 	.hash {
@@ -228,38 +488,161 @@
 		text-overflow: ellipsis;
 	}
 
-	.member-list {
-		border-top: 1px solid var(--border);
-		overflow-y: auto;
-		max-height: 200px;
-		padding-bottom: 8px;
-	}
-
-	.member {
+	.user-panel {
 		display: flex;
 		align-items: center;
 		gap: 8px;
-		padding: 4px 16px;
-		font-size: 13px;
-		color: var(--text-muted);
+		padding: 8px 12px;
+		background: var(--bg-server-bar);
+		border-top: 1px solid var(--border);
+		cursor: pointer;
+		width: 100%;
+		text-align: left;
 	}
 
-	.presence-dot {
-		width: 8px;
-		height: 8px;
-		border-radius: 50%;
+	.user-panel:hover {
+		background: var(--bg-hover);
+	}
+
+	.user-panel-avatar-wrapper {
+		position: relative;
 		flex-shrink: 0;
-		background-color: #57534e;
+		width: 32px;
+		height: 32px;
 	}
 
-	.presence-dot.online {
+	.user-panel-avatar {
+		width: 32px;
+		height: 32px;
+		border-radius: 50%;
+		object-fit: cover;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.user-panel-avatar-fallback {
+		background: var(--bg-tertiary);
+		color: var(--text-muted);
+		font-size: 14px;
+		font-weight: 600;
+	}
+
+	.user-panel-presence {
+		width: 10px;
+		height: 10px;
+		border-radius: 50%;
 		background-color: var(--accent);
+		position: absolute;
+		bottom: -2px;
+		right: -2px;
+		border: 2px solid var(--bg-server-bar);
 	}
 
-	.member-name {
+	.user-panel-name {
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--text-primary);
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
+	}
+
+	.modal-overlay {
+		position: fixed;
+		inset: 0;
+		background: rgba(0, 0, 0, 0.6);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		z-index: 100;
+	}
+
+	.modal-dialog {
+		background: var(--bg-sidebar);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		padding: 20px 24px;
+		max-width: 400px;
+		width: 90%;
+	}
+
+	.modal-dialog h3 {
+		margin: 0 0 8px;
+		font-size: 16px;
+	}
+
+	.modal-dialog p {
+		color: var(--text-muted);
+		font-size: 14px;
+		margin: 0 0 16px;
+		line-height: 1.4;
+	}
+
+	.modal-actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 8px;
+	}
+
+	.btn-cancel, .btn-danger {
+		padding: 8px 16px;
+		border-radius: 4px;
+		font-size: 14px;
+		cursor: pointer;
+	}
+
+	.btn-cancel {
+		background: var(--bg-primary);
+		color: var(--text-primary);
+	}
+
+	.btn-cancel:hover {
+		background: var(--bg-hover);
+	}
+
+	.btn-danger {
+		background: #dc2626;
+		color: white;
+	}
+
+	.btn-danger:hover {
+		background: #b91c1c;
+	}
+
+	.btn-danger:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.btn-save {
+		padding: 8px 16px;
+		border-radius: 4px;
+		font-size: 14px;
+		cursor: pointer;
+		background: var(--accent);
+		color: white;
+	}
+
+	.btn-save:hover:not(:disabled) {
+		background: var(--accent-hover);
+	}
+
+	.btn-save:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.rename-input {
+		width: 100%;
+		padding: 8px 10px;
+		background: var(--bg-primary);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		color: var(--text-primary);
+		font-size: 14px;
+		font-family: inherit;
+		margin-bottom: 16px;
 	}
 
 	@media (max-width: 768px) {

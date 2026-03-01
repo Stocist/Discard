@@ -22,9 +22,10 @@
 		return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
 	}
 
-	let { channelId, channelName }: {
+	let { channelId, channelName, onToggleMembers }: {
 		channelId: string;
 		channelName: string;
+		onToggleMembers?: () => void;
 	} = $props();
 
 	let messages = $state<Message[]>([]);
@@ -240,6 +241,13 @@
 	<div class="chat-header">
 		<span class="hash">#</span>
 		<span class="channel-name">{channelName}</span>
+		{#if onToggleMembers}
+			<button class="header-btn" title="Toggle member list" onclick={onToggleMembers}>
+				<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+					<path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/>
+				</svg>
+			</button>
+		{/if}
 	</div>
 
 	<div class="messages" bind:this={messagesEl} onscroll={handleScroll}>
@@ -260,8 +268,12 @@
 			>
 				{#if !grouped}
 					<div class="message-header">
-						<span class="avatar" style="background: {avatarColor(message.author_username ?? message.author_id)}">{(message.author_username ?? message.author_id).charAt(0).toUpperCase()}</span>
-						<span class="author">{message.author_username ?? message.author_id}</span>
+						{#if message.author_avatar_url}
+							<img class="avatar" src="/uploads/{message.author_avatar_url}" alt="" />
+						{:else}
+							<span class="avatar" style="background: {avatarColor(message.author_username ?? message.author_id)}">{(message.author_username ?? message.author_id).charAt(0).toUpperCase()}</span>
+						{/if}
+						<span class="author">{message.author_display_name ?? message.author_username ?? message.author_id}</span>
 						<span class="timestamp">{formatTime(message.created_at)}</span>
 					</div>
 				{/if}
@@ -341,6 +353,21 @@
 		font-size: 15px;
 	}
 
+	.header-btn {
+		margin-left: auto;
+		color: var(--text-muted);
+		padding: 4px;
+		border-radius: 4px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.header-btn:hover {
+		color: var(--text-primary);
+		background: var(--bg-hover);
+	}
+
 	.messages {
 		flex: 1;
 		overflow-y: auto;
@@ -394,6 +421,7 @@
 		font-weight: 600;
 		color: white;
 		flex-shrink: 0;
+		object-fit: cover;
 	}
 
 	.author {

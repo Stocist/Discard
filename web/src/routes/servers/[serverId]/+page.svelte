@@ -10,6 +10,10 @@
 		const sid = page.params.serverId;
 		if (!sid) return;
 
+		// Preserve query params (e.g. ?settings=1) through the redirect
+		const searchParams = page.url.searchParams.toString();
+		const qs = searchParams ? `?${searchParams}` : '';
+
 		loading = true;
 		error = '';
 
@@ -17,7 +21,7 @@
 			try {
 				const channels = await listChannels(sid);
 				if (channels.length > 0) {
-					goto(`/servers/${sid}/channels/${channels[0].id}`, { replaceState: true });
+					goto(`/servers/${sid}/channels/${channels[0].id}${qs}`, { replaceState: true });
 					return;
 				}
 				error = 'No channels found in this server.';

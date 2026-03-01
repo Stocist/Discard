@@ -1,13 +1,17 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import type { Server } from '$lib/types';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { listServers, createServer } from '$lib/api';
+	import { listServers, createServer, fetchMe, deleteServer } from '$lib/api';
+	import { subscribeServerEvents } from '$lib/ws';
+	import ContextMenu from './ContextMenu.svelte';
 
 	let servers = $state<Server[]>([]);
 	let showCreateModal = $state(false);
 	let newServerName = $state('');
 	let loading = $state(false);
+	let currentUserId = $state('');
 
 	const currentServerId = $derived(page.params?.serverId ?? '');
 
@@ -38,7 +42,70 @@
 	$effect(() => {
 		loadServers();
 	});
+
+	$effect(() => {
+		fetchMe().then(u => { currentUserId = u.id; }).catch(() => {});
+	});
+
+	onMount(() => {
+		return subscribeServerEvents((event) => {
+			if (event.type === 'server_update') {
+				servers = servers.map(s => s.id === event.server.id ? event.server : s);
+			} else if (event.type === 'server_delete') {
+				servers = servers.filter(s => s.id !== event.server_id);
+				if (currentServerId === event.server_id) {
+					goto('/');
+				}
+			}
+		});
+	});
+
+	// Server context menu
+	let serverCtx = $state<{ x: number; y: number; serverId: string } | null>(null);
+	let confirmDeleteServerId = $state<string | null>(null);
+	let deletingServer = $state(false);
+
+	function handleServerContextMenu(e: MouseEvent, srvId: string) {
+		e.preventDefault();
+		serverCtx = { x: e.clientX, y: e.clientY, serverId: srvId };
+	}
+
+	function serverContextItems(srvId: string) {
+		const srv = servers.find(s => s.id === srvId);
+		const isOwner = !!srv && currentUserId === srv.owner_id;
+		const items: { label: string; action: () => void; danger?: boolean }[] = [
+			{ label: 'Copy Server ID', action: () => navigator.clipboard.writeText(srvId) },
+		];
+		if (isOwner) {
+			items.push({ label: 'Server Settings', action: () => goto(`/servers/${srvId}?settings=1`) });
+			items.push({ label: 'Delete Server', action: () => { confirmDeleteServerId = srvId; }, danger: true });
+		}
+		return items;
+	}
+
+	async function handleDeleteServer() {
+		if (!confirmDeleteServerId || deletingServer) return;
+		deletingServer = true;
+		try {
+			await deleteServer(confirmDeleteServerId);
+			// WS broadcast will handle the removal from the list
+			confirmDeleteServerId = null;
+		} catch (e) {
+			console.error('Failed to delete server:', e);
+		} finally {
+			deletingServer = false;
+		}
+	}
+
+	function handleGlobalKeydown(e: KeyboardEvent) {
+		if (e.key === 'Escape') {
+			if (confirmDeleteServerId) { confirmDeleteServerId = null; return; }
+			if (showCreateModal) { showCreateModal = false; newServerName = ''; return; }
+		}
+	}
 </script>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 <nav class="server-bar">
 	<div class="servers">
@@ -46,10 +113,16 @@
 			<button
 				class="server-icon"
 				class:active={currentServerId === server.id}
+				class:has-icon={!!server.icon_path}
 				title={server.name}
 				onclick={() => goto(`/servers/${server.id}`)}
+				oncontextmenu={(e) => handleServerContextMenu(e, server.id)}
 			>
-				{server.name.charAt(0).toUpperCase()}
+				{#if server.icon_path}
+					<img src={`/uploads/${server.icon_path}`} alt={server.name} class="server-img" />
+				{:else}
+					{server.name.charAt(0).toUpperCase()}
+				{/if}
 			</button>
 		{/each}
 	</div>
@@ -63,9 +136,9 @@
 
 {#if showCreateModal}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="modal-overlay" onclick={() => (showCreateModal = false)} onkeydown={(e) => e.key === 'Escape' && (showCreateModal = false)}>
+	<div class="modal-overlay" onclick={() => (showCreateModal = false)}>
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
+		<div class="modal" onclick={(e) => e.stopPropagation()}>
 			<h2>Create a Server</h2>
 			<form onsubmit={(e) => { e.preventDefault(); handleCreate(); }}>
 				<input
@@ -80,6 +153,33 @@
 					</button>
 				</div>
 			</form>
+		</div>
+	</div>
+{/if}
+
+{#if serverCtx}
+	<ContextMenu
+		x={serverCtx.x}
+		y={serverCtx.y}
+		items={serverContextItems(serverCtx.serverId)}
+		onClose={() => (serverCtx = null)}
+	/>
+{/if}
+
+{#if confirmDeleteServerId}
+	{@const serverToDelete = servers.find(s => s.id === confirmDeleteServerId)}
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="modal-overlay" onclick={() => { confirmDeleteServerId = null; }}>
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="modal" onclick={(e) => e.stopPropagation()}>
+			<h2>Delete Server</h2>
+			<p class="delete-warning">Are you sure you want to delete <strong>{serverToDelete?.name ?? 'this server'}</strong>? All channels and messages will be permanently removed.</p>
+			<div class="modal-actions">
+				<button type="button" class="cancel-btn" onclick={() => (confirmDeleteServerId = null)}>Cancel</button>
+				<button type="button" class="delete-btn" onclick={handleDeleteServer} disabled={deletingServer}>
+					{deletingServer ? 'Deleting...' : 'Delete Server'}
+				</button>
+			</div>
 		</div>
 	</div>
 {/if}
@@ -116,6 +216,17 @@
 		font-weight: 600;
 		color: var(--text-primary);
 		transition: border-radius 0.15s;
+	}
+
+	.server-icon.has-icon {
+		padding: 0;
+		overflow: hidden;
+	}
+
+	.server-img {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
 	}
 
 	.server-icon:hover,
@@ -202,6 +313,30 @@
 	}
 
 	.create-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.delete-warning {
+		color: var(--text-muted);
+		font-size: 14px;
+		line-height: 1.5;
+		margin-bottom: 16px;
+	}
+
+	.delete-btn {
+		padding: 8px 16px;
+		background: #ef4444;
+		color: white;
+		border-radius: 4px;
+		font-weight: 500;
+	}
+
+	.delete-btn:hover:not(:disabled) {
+		background: #dc2626;
+	}
+
+	.delete-btn:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
 	}

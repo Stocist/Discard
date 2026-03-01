@@ -20,6 +20,25 @@ export function isUserOnline(userId: string): boolean {
 	return onlineSet.has(userId);
 }
 
+// Server event callbacks (update/delete).
+import type { Server } from './types';
+
+type ServerEventHandler = (event: { type: 'server_update'; server: Server } | { type: 'server_delete'; server_id: string }) => void;
+let serverListeners = new Set<ServerEventHandler>();
+
+export function subscribeServerEvents(fn: ServerEventHandler): () => void {
+	serverListeners.add(fn);
+	return () => serverListeners.delete(fn);
+}
+
+function handleServerMessage(data: { type: string; server?: Server; server_id?: string }) {
+	if (data.type === 'server_update' && data.server) {
+		for (const fn of serverListeners) fn({ type: 'server_update', server: data.server });
+	} else if (data.type === 'server_delete' && data.server_id) {
+		for (const fn of serverListeners) fn({ type: 'server_delete', server_id: data.server_id });
+	}
+}
+
 function handlePresenceMessage(data: { type: string; user_id?: string; status?: string; user_ids?: string[] }) {
 	if (data.type === 'presence_update' && data.user_id && data.status) {
 		if (data.status === 'online') {
@@ -32,6 +51,15 @@ function handlePresenceMessage(data: { type: string; user_id?: string; status?: 
 		onlineSet = new Set(data.user_ids);
 		notify();
 	}
+}
+
+// Unread message callbacks — notified with channel_id when a new message arrives.
+type UnreadHandler = (channelId: string) => void;
+let unreadListeners = new Set<UnreadHandler>();
+
+export function subscribeUnread(fn: UnreadHandler): () => void {
+	unreadListeners.add(fn);
+	return () => unreadListeners.delete(fn);
 }
 
 export function createWSConnection(): WebSocket {
@@ -47,9 +75,13 @@ export function createWSConnection(): WebSocket {
 			const data = JSON.parse(event.data);
 			if (data.type === 'presence_update' || data.type === 'presence_list') {
 				handlePresenceMessage(data);
+			} else if (data.type === 'server_update' || data.type === 'server_delete') {
+				handleServerMessage(data);
+			} else if (data.type === 'message' && data.message?.channel_id) {
+				for (const fn of unreadListeners) fn(data.message.channel_id);
 			}
 		} catch {
-			// Not JSON or not a presence message — ignore here.
+			// Not JSON or not a known event — ignore here.
 		}
 	});
 

@@ -30,6 +30,21 @@ export function fetchMe(): Promise<User> {
 	return apiFetch('/me');
 }
 
+export async function updateMe(displayName?: string, avatar?: File): Promise<User> {
+	const form = new FormData();
+	if (displayName !== undefined) form.append('display_name', displayName);
+	if (avatar) form.append('avatar', avatar);
+	const res = await fetch('/api/me', {
+		method: 'PUT',
+		body: form
+	});
+	if (!res.ok) {
+		const text = await res.text().catch(() => res.statusText);
+		throw new ApiError(res.status, text);
+	}
+	return res.json();
+}
+
 // Servers
 export function createServer(name: string): Promise<Server> {
 	return apiFetch('/servers', {
@@ -53,6 +68,31 @@ export function joinServer(inviteCode: string): Promise<Server> {
 	});
 }
 
+export async function updateServer(serverId: string, name: string, icon?: File): Promise<Server> {
+	if (icon) {
+		const form = new FormData();
+		form.append('name', name);
+		form.append('icon', icon);
+		const res = await fetch(`/api/servers/${serverId}`, {
+			method: 'PUT',
+			body: form
+		});
+		if (!res.ok) {
+			const text = await res.text().catch(() => res.statusText);
+			throw new ApiError(res.status, text);
+		}
+		return res.json();
+	}
+	return apiFetch(`/servers/${serverId}`, {
+		method: 'PUT',
+		body: JSON.stringify({ name })
+	});
+}
+
+export function deleteServer(serverId: string): Promise<void> {
+	return apiFetch(`/servers/${serverId}`, { method: 'DELETE' });
+}
+
 export function leaveServer(serverId: string): Promise<void> {
 	return apiFetch(`/servers/${serverId}/members/me`, { method: 'DELETE' });
 }
@@ -67,6 +107,17 @@ export function createChannel(serverId: string, name: string, type?: string): Pr
 
 export function listChannels(serverId: string): Promise<Channel[]> {
 	return apiFetch(`/servers/${serverId}/channels`);
+}
+
+export function updateChannel(serverId: string, channelId: string, name: string): Promise<Channel> {
+	return apiFetch(`/servers/${serverId}/channels/${channelId}`, {
+		method: 'PUT',
+		body: JSON.stringify({ name })
+	});
+}
+
+export function deleteChannel(serverId: string, channelId: string): Promise<void> {
+	return apiFetch(`/servers/${serverId}/channels/${channelId}`, { method: 'DELETE' });
 }
 
 // Members
@@ -139,4 +190,13 @@ export function acceptFriend(friendshipId: string): Promise<Friendship> {
 
 export function listFriends(): Promise<Friendship[]> {
 	return apiFetch('/friends');
+}
+
+// Read state / unread
+export function markChannelRead(channelId: string): Promise<void> {
+	return apiFetch(`/channels/${channelId}/read`, { method: 'PUT' });
+}
+
+export function getUnreadCounts(serverId: string): Promise<Record<string, number>> {
+	return apiFetch(`/servers/${serverId}/unread`);
 }
