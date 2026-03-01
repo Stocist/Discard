@@ -63,6 +63,20 @@ func (r *UserRepo) UpdateUserStatus(ctx context.Context, id uuid.UUID, status st
 	return err
 }
 
+func (r *UserRepo) UpdateProfile(ctx context.Context, id uuid.UUID, displayName *string, avatarPath *string) (*models.User, error) {
+	u := &models.User{}
+	err := r.DB.QueryRowContext(ctx,
+		`UPDATE users SET display_name = COALESCE($2, display_name), avatar_path = COALESCE($3, avatar_path), updated_at = $4
+		 WHERE id = $1
+		 RETURNING id, username, display_name, avatar_path, tailscale_id, password_hash, status, created_at, updated_at`,
+		id, displayName, avatarPath, time.Now(),
+	).Scan(&u.ID, &u.Username, &u.DisplayName, &u.AvatarPath, &u.TailscaleID, &u.PasswordHash, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
 // ServerRepo handles server-related database operations.
 type ServerRepo struct {
 	DB *sql.DB
@@ -115,6 +129,34 @@ func (r *ServerRepo) ListUserServers(ctx context.Context, userID uuid.UUID) ([]m
 	return servers, rows.Err()
 }
 
+func (r *ServerRepo) UpdateServer(ctx context.Context, id uuid.UUID, name string, iconPath *string) (*models.Server, error) {
+	s := &models.Server{}
+	err := r.DB.QueryRowContext(ctx,
+		`UPDATE servers SET name = $1, icon_path = COALESCE($3, icon_path) WHERE id = $2
+		 RETURNING id, name, icon_path, owner_id, invite_code, created_at`,
+		name, id, iconPath,
+	).Scan(&s.ID, &s.Name, &s.IconPath, &s.OwnerID, &s.InviteCode, &s.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (r *ServerRepo) DeleteServer(ctx context.Context, id uuid.UUID) error {
+	result, err := r.DB.ExecContext(ctx, `DELETE FROM servers WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // ChannelRepo handles channel-related database operations.
 type ChannelRepo struct {
 	DB *sql.DB
@@ -141,6 +183,36 @@ func (r *ChannelRepo) GetChannelByID(ctx context.Context, id uuid.UUID) (*models
 		return nil, err
 	}
 	return c, nil
+}
+
+func (r *ChannelRepo) UpdateChannel(ctx context.Context, channelID uuid.UUID, name string) (*models.Channel, error) {
+	c := &models.Channel{}
+	err := r.DB.QueryRowContext(ctx,
+		`UPDATE channels SET name = $1 WHERE id = $2
+		 RETURNING id, server_id, name, topic, type, position, created_at`,
+		name, channelID,
+	).Scan(&c.ID, &c.ServerID, &c.Name, &c.Topic, &c.Type, &c.Position, &c.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (r *ChannelRepo) DeleteChannel(ctx context.Context, channelID uuid.UUID) error {
+	result, err := r.DB.ExecContext(ctx,
+		`DELETE FROM channels WHERE id = $1`, channelID,
+	)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (r *ChannelRepo) ListServerChannels(ctx context.Context, serverID uuid.UUID) ([]models.Channel, error) {
@@ -190,7 +262,7 @@ func (r *ServerMemberRepo) RemoveMember(ctx context.Context, userID, serverID uu
 
 func (r *ServerMemberRepo) ListMembers(ctx context.Context, serverID uuid.UUID) ([]models.ServerMember, error) {
 	rows, err := r.DB.QueryContext(ctx,
-		`SELECT sm.user_id, sm.server_id, sm.nickname, sm.joined_at, u.username
+		`SELECT sm.user_id, sm.server_id, sm.nickname, sm.joined_at, u.username, u.display_name, u.avatar_path
 		 FROM server_members sm
 		 JOIN users u ON u.id = sm.user_id
 		 WHERE sm.server_id = $1
@@ -204,7 +276,7 @@ func (r *ServerMemberRepo) ListMembers(ctx context.Context, serverID uuid.UUID) 
 	var members []models.ServerMember
 	for rows.Next() {
 		var m models.ServerMember
-		if err := rows.Scan(&m.UserID, &m.ServerID, &m.Nickname, &m.JoinedAt, &m.Username); err != nil {
+		if err := rows.Scan(&m.UserID, &m.ServerID, &m.Nickname, &m.JoinedAt, &m.Username, &m.DisplayName, &m.AvatarURL); err != nil {
 			return nil, err
 		}
 		members = append(members, m)
@@ -378,20 +450,20 @@ func (r *MessageRepo) Create(ctx context.Context, m *models.Message) error {
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			RETURNING author_id
 		)
-		SELECT u.username FROM ins JOIN users u ON u.id = ins.author_id`,
+		SELECT u.username, u.display_name, u.avatar_path FROM ins JOIN users u ON u.id = ins.author_id`,
 		m.ID, m.ChannelID, m.AuthorID, m.Content, m.Edited, m.CreatedAt, m.UpdatedAt,
-	).Scan(&m.AuthorUsername)
+	).Scan(&m.AuthorUsername, &m.AuthorDisplayName, &m.AuthorAvatarURL)
 	return err
 }
 
 func (r *MessageRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.Message, error) {
 	m := &models.Message{}
 	err := r.DB.QueryRowContext(ctx,
-		`SELECT m.id, m.channel_id, m.author_id, m.content, m.edited, m.created_at, m.updated_at, u.username
+		`SELECT m.id, m.channel_id, m.author_id, m.content, m.edited, m.created_at, m.updated_at, u.username, u.display_name, u.avatar_path
 		 FROM messages m
 		 JOIN users u ON u.id = m.author_id
 		 WHERE m.id = $1`, id,
-	).Scan(&m.ID, &m.ChannelID, &m.AuthorID, &m.Content, &m.Edited, &m.CreatedAt, &m.UpdatedAt, &m.AuthorUsername)
+	).Scan(&m.ID, &m.ChannelID, &m.AuthorID, &m.Content, &m.Edited, &m.CreatedAt, &m.UpdatedAt, &m.AuthorUsername, &m.AuthorDisplayName, &m.AuthorAvatarURL)
 	if err != nil {
 		return nil, err
 	}
@@ -406,10 +478,10 @@ func (r *MessageRepo) Update(ctx context.Context, messageID, authorID uuid.UUID,
 			WHERE id = $3 AND author_id = $4
 			RETURNING id, channel_id, author_id, content, edited, created_at, updated_at
 		)
-		SELECT upd.id, upd.channel_id, upd.author_id, upd.content, upd.edited, upd.created_at, upd.updated_at, u.username
+		SELECT upd.id, upd.channel_id, upd.author_id, upd.content, upd.edited, upd.created_at, upd.updated_at, u.username, u.display_name, u.avatar_path
 		FROM upd JOIN users u ON u.id = upd.author_id`,
 		content, time.Now(), messageID, authorID,
-	).Scan(&m.ID, &m.ChannelID, &m.AuthorID, &m.Content, &m.Edited, &m.CreatedAt, &m.UpdatedAt, &m.AuthorUsername)
+	).Scan(&m.ID, &m.ChannelID, &m.AuthorID, &m.Content, &m.Edited, &m.CreatedAt, &m.UpdatedAt, &m.AuthorUsername, &m.AuthorDisplayName, &m.AuthorAvatarURL)
 	if err != nil {
 		return nil, err
 	}
@@ -440,7 +512,7 @@ func (r *MessageRepo) ListByChannel(ctx context.Context, channelID uuid.UUID, be
 
 	if before != nil {
 		rows, err = r.DB.QueryContext(ctx,
-			`SELECT m.id, m.channel_id, m.author_id, m.content, m.edited, m.created_at, m.updated_at, u.username
+			`SELECT m.id, m.channel_id, m.author_id, m.content, m.edited, m.created_at, m.updated_at, u.username, u.display_name, u.avatar_path
 			 FROM messages m
 			 JOIN users u ON u.id = m.author_id
 			 WHERE m.channel_id = $1
@@ -450,7 +522,7 @@ func (r *MessageRepo) ListByChannel(ctx context.Context, channelID uuid.UUID, be
 		)
 	} else {
 		rows, err = r.DB.QueryContext(ctx,
-			`SELECT m.id, m.channel_id, m.author_id, m.content, m.edited, m.created_at, m.updated_at, u.username
+			`SELECT m.id, m.channel_id, m.author_id, m.content, m.edited, m.created_at, m.updated_at, u.username, u.display_name, u.avatar_path
 			 FROM messages m
 			 JOIN users u ON u.id = m.author_id
 			 WHERE m.channel_id = $1
@@ -466,7 +538,7 @@ func (r *MessageRepo) ListByChannel(ctx context.Context, channelID uuid.UUID, be
 	var messages []models.Message
 	for rows.Next() {
 		var m models.Message
-		if err := rows.Scan(&m.ID, &m.ChannelID, &m.AuthorID, &m.Content, &m.Edited, &m.CreatedAt, &m.UpdatedAt, &m.AuthorUsername); err != nil {
+		if err := rows.Scan(&m.ID, &m.ChannelID, &m.AuthorID, &m.Content, &m.Edited, &m.CreatedAt, &m.UpdatedAt, &m.AuthorUsername, &m.AuthorDisplayName, &m.AuthorAvatarURL); err != nil {
 			return nil, err
 		}
 		messages = append(messages, m)

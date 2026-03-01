@@ -164,6 +164,18 @@ func (h *Hub) broadcastPresence(userID uuid.UUID, status string) {
 	h.mu.RUnlock()
 }
 
+// BroadcastAll sends data to every connected client.
+func (h *Hub) BroadcastAll(data []byte) {
+	h.mu.RLock()
+	for client := range h.allClients {
+		select {
+		case client.send <- data:
+		default:
+		}
+	}
+	h.mu.RUnlock()
+}
+
 // SendToClient sends raw JSON data to a single client.
 func (h *Hub) SendToClient(client *Client, data []byte) {
 	select {

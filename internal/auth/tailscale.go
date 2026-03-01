@@ -24,9 +24,10 @@ type UserRepo interface {
 // tailscaleWhoisResponse is the subset of the Tailscale localapi whois response we care about.
 type tailscaleWhoisResponse struct {
 	UserProfile struct {
-		ID          int64  `json:"ID"`
-		LoginName   string `json:"LoginName"`
-		DisplayName string `json:"DisplayName"`
+		ID            int64  `json:"ID"`
+		LoginName     string `json:"LoginName"`
+		DisplayName   string `json:"DisplayName"`
+		ProfilePicURL string `json:"ProfilePicURL"`
 	} `json:"UserProfile"`
 }
 
@@ -160,6 +161,9 @@ func tailscaleAuth(ctx context.Context, repo UserRepo, client *http.Client, remo
 		Status:      "online",
 		CreatedAt:   now,
 		UpdatedAt:   now,
+	}
+	if whois.UserProfile.ProfilePicURL != "" {
+		u.AvatarPath = &whois.UserProfile.ProfilePicURL
 	}
 	if err := repo.Create(ctx, u); err != nil {
 		return nil, fmt.Errorf("create user: %w", err)

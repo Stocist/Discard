@@ -58,16 +58,21 @@ func (s *Server) SetupRoutes() {
 
 	// Me
 	a("GET /api/me", s.handleMe)
+	a("PUT /api/me", s.handleUpdateMe)
 
 	// Servers
 	a("POST /api/servers", s.handleCreateServer)
 	a("GET /api/servers", s.handleListServers)
 	a("POST /api/servers/join", s.handleJoinServer)
 	a("GET /api/servers/{id}", s.handleGetServer)
+	a("PUT /api/servers/{id}", s.handleUpdateServer)
+	a("DELETE /api/servers/{id}", s.handleDeleteServer)
 
 	// Channels
 	a("POST /api/servers/{id}/channels", s.handleCreateChannel)
 	a("GET /api/servers/{id}/channels", s.handleListChannels)
+	a("PUT /api/servers/{id}/channels/{channelId}", s.handleUpdateChannel)
+	a("DELETE /api/servers/{id}/channels/{channelId}", s.handleDeleteChannel)
 
 	// Members
 	a("GET /api/servers/{id}/members", s.handleListMembers)
@@ -83,6 +88,10 @@ func (s *Server) SetupRoutes() {
 	a("POST /api/channels/{id}/messages", s.handleCreateMessage)
 	a("PUT /api/messages/{id}", s.handleEditMessage)
 	a("DELETE /api/messages/{id}", s.handleDeleteMessage)
+
+	// Read state / unread
+	a("PUT /api/channels/{id}/read", s.handleMarkRead)
+	a("GET /api/servers/{id}/unread", s.handleUnreadCounts)
 
 	// Uploads — static file server
 	s.router.Handle("GET /uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(s.uploadDir))))

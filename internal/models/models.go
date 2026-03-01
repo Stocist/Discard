@@ -45,7 +45,9 @@ type Message struct {
 	Edited         bool         `json:"edited"`
 	CreatedAt      time.Time    `json:"created_at"`
 	UpdatedAt      time.Time    `json:"updated_at"`
-	AuthorUsername string       `json:"author_username,omitempty"`
+	AuthorUsername    string       `json:"author_username,omitempty"`
+	AuthorDisplayName *string    `json:"author_display_name,omitempty"`
+	AuthorAvatarURL  *string     `json:"author_avatar_url,omitempty"`
 	Attachments    []Attachment `json:"attachments,omitempty"`
 }
 
@@ -62,11 +64,13 @@ type Attachment struct {
 }
 
 type ServerMember struct {
-	UserID   uuid.UUID `json:"user_id"`
-	ServerID uuid.UUID `json:"server_id"`
-	Nickname *string   `json:"nickname"`
-	JoinedAt time.Time `json:"joined_at"`
-	Username string    `json:"username,omitempty"`
+	UserID    uuid.UUID `json:"user_id"`
+	ServerID  uuid.UUID `json:"server_id"`
+	Nickname  *string   `json:"nickname"`
+	JoinedAt  time.Time `json:"joined_at"`
+	Username    string    `json:"username,omitempty"`
+	DisplayName *string  `json:"display_name,omitempty"`
+	AvatarURL   *string  `json:"avatar_url,omitempty"`
 }
 
 type Friendship struct {
@@ -84,4 +88,11 @@ type DMMember struct {
 	ChannelID uuid.UUID `json:"channel_id"`
 	UserID    uuid.UUID `json:"user_id"`
 	JoinedAt  time.Time `json:"joined_at"`
+}
+
+type ChannelReadState struct {
+	UserID            uuid.UUID  `json:"user_id"`
+	ChannelID         uuid.UUID  `json:"channel_id"`
+	LastReadMessageID *uuid.UUID `json:"last_read_message_id"`
+	LastReadAt        time.Time  `json:"last_read_at"`
 }

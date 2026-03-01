@@ -27,6 +27,51 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(user)
 }
 
+func (s *Server) handleUpdateMe(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		jsonError(w, "invalid multipart form", http.StatusBadRequest)
+		return
+	}
+
+	var displayName *string
+	if dn := strings.TrimSpace(r.FormValue("display_name")); dn != "" {
+		if len(dn) > 64 {
+			jsonError(w, "display name must be 64 characters or less", http.StatusBadRequest)
+			return
+		}
+		displayName = &dn
+	}
+
+	var avatarPath *string
+	if fh, _, err := r.FormFile("avatar"); err == nil {
+		fh.Close()
+		fileHeader := r.MultipartForm.File["avatar"][0]
+		result, err := upload.ProcessFile(s.uploadDir, fileHeader)
+		if err != nil {
+			log.Printf("avatar upload error: %v", err)
+			jsonError(w, "failed to process avatar", http.StatusBadRequest)
+			return
+		}
+		avatarPath = &result.FilePath
+	}
+
+	userRepo := &database.UserRepo{DB: s.db}
+	updated, err := userRepo.UpdateProfile(r.Context(), user.ID, displayName, avatarPath)
+	if err != nil {
+		jsonError(w, "failed to update profile", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updated)
+}
+
 func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -165,6 +210,143 @@ func (s *Server) handleGetServer(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(srv)
 }
 
+func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	serverID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		jsonError(w, "invalid server id", http.StatusBadRequest)
+		return
+	}
+
+	// Only the owner can update the server.
+	serverRepo := &database.ServerRepo{DB: s.db}
+	srv, err := serverRepo.GetServerByID(r.Context(), serverID)
+	if err == sql.ErrNoRows {
+		jsonError(w, "server not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, "failed to get server", http.StatusInternalServerError)
+		return
+	}
+	if srv.OwnerID != user.ID {
+		jsonError(w, "only the server owner can update settings", http.StatusForbidden)
+		return
+	}
+
+	var name string
+	var iconPath *string
+
+	contentType := r.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		if err := r.ParseMultipartForm(10 << 20); err != nil {
+			jsonError(w, "invalid multipart form", http.StatusBadRequest)
+			return
+		}
+		name = strings.TrimSpace(r.FormValue("name"))
+
+		// Process optional icon file.
+		if fh, _, err := r.FormFile("icon"); err == nil {
+			fh.Close()
+			fileHeader := r.MultipartForm.File["icon"][0]
+			result, err := upload.ProcessFile(s.uploadDir, fileHeader)
+			if err != nil {
+				log.Printf("icon upload error: %v", err)
+				jsonError(w, "failed to process icon", http.StatusBadRequest)
+				return
+			}
+			iconPath = &result.FilePath
+		}
+	} else {
+		var input struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			jsonError(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		name = strings.TrimSpace(input.Name)
+	}
+
+	if name == "" {
+		jsonError(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	if len(name) > 100 {
+		jsonError(w, "server name must be 100 characters or less", http.StatusBadRequest)
+		return
+	}
+
+	updated, err := serverRepo.UpdateServer(r.Context(), serverID, name, iconPath)
+	if err != nil {
+		jsonError(w, "failed to update server", http.StatusInternalServerError)
+		return
+	}
+
+	// Broadcast server update to all clients so sidebars refresh.
+	out, err := json.Marshal(map[string]any{
+		"type":   "server_update",
+		"server": updated,
+	})
+	if err == nil {
+		s.hub.BroadcastAll(out)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updated)
+}
+
+func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	serverID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		jsonError(w, "invalid server id", http.StatusBadRequest)
+		return
+	}
+
+	// Only the owner can delete the server.
+	serverRepo := &database.ServerRepo{DB: s.db}
+	srv, err := serverRepo.GetServerByID(r.Context(), serverID)
+	if err == sql.ErrNoRows {
+		jsonError(w, "server not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, "failed to get server", http.StatusInternalServerError)
+		return
+	}
+	if srv.OwnerID != user.ID {
+		jsonError(w, "only the server owner can delete this server", http.StatusForbidden)
+		return
+	}
+
+	if err := serverRepo.DeleteServer(r.Context(), serverID); err != nil {
+		jsonError(w, "failed to delete server", http.StatusInternalServerError)
+		return
+	}
+
+	// Broadcast server deletion to all clients.
+	out, err := json.Marshal(map[string]any{
+		"type":      "server_delete",
+		"server_id": serverID.String(),
+	})
+	if err == nil {
+		s.hub.BroadcastAll(out)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // --- Channels ---
 
 func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
@@ -268,6 +450,162 @@ func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(channels)
+}
+
+func (s *Server) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	serverID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		jsonError(w, "invalid server id", http.StatusBadRequest)
+		return
+	}
+
+	channelID, err := uuid.Parse(r.PathValue("channelId"))
+	if err != nil {
+		jsonError(w, "invalid channel id", http.StatusBadRequest)
+		return
+	}
+
+	// Only server owner can rename channels.
+	serverRepo := &database.ServerRepo{DB: s.db}
+	srv, err := serverRepo.GetServerByID(r.Context(), serverID)
+	if err == sql.ErrNoRows {
+		jsonError(w, "server not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, "failed to get server", http.StatusInternalServerError)
+		return
+	}
+	if srv.OwnerID != user.ID {
+		jsonError(w, "only the server owner can rename channels", http.StatusForbidden)
+		return
+	}
+
+	var input struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	input.Name = strings.TrimSpace(input.Name)
+	if input.Name == "" {
+		jsonError(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	if len(input.Name) > 100 {
+		jsonError(w, "channel name must be 100 characters or less", http.StatusBadRequest)
+		return
+	}
+
+	// Verify channel belongs to this server.
+	channelRepo := &database.ChannelRepo{DB: s.db}
+	ch, err := channelRepo.GetChannelByID(r.Context(), channelID)
+	if err == sql.ErrNoRows {
+		jsonError(w, "channel not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, "failed to get channel", http.StatusInternalServerError)
+		return
+	}
+	if ch.ServerID == nil || *ch.ServerID != serverID {
+		jsonError(w, "channel does not belong to this server", http.StatusBadRequest)
+		return
+	}
+
+	updated, err := channelRepo.UpdateChannel(r.Context(), channelID, input.Name)
+	if err != nil {
+		jsonError(w, "failed to update channel", http.StatusInternalServerError)
+		return
+	}
+
+	// Broadcast channel update to all connected clients.
+	out, err := json.Marshal(map[string]any{
+		"type":    "channel_update",
+		"channel": updated,
+	})
+	if err == nil {
+		s.hub.BroadcastAll(out)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updated)
+}
+
+func (s *Server) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	serverID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		jsonError(w, "invalid server id", http.StatusBadRequest)
+		return
+	}
+
+	channelID, err := uuid.Parse(r.PathValue("channelId"))
+	if err != nil {
+		jsonError(w, "invalid channel id", http.StatusBadRequest)
+		return
+	}
+
+	// Only server owner can delete channels.
+	serverRepo := &database.ServerRepo{DB: s.db}
+	srv, err := serverRepo.GetServerByID(r.Context(), serverID)
+	if err == sql.ErrNoRows {
+		jsonError(w, "server not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, "failed to get server", http.StatusInternalServerError)
+		return
+	}
+	if srv.OwnerID != user.ID {
+		jsonError(w, "only the server owner can delete channels", http.StatusForbidden)
+		return
+	}
+
+	// Verify channel belongs to this server.
+	channelRepo := &database.ChannelRepo{DB: s.db}
+	ch, err := channelRepo.GetChannelByID(r.Context(), channelID)
+	if err == sql.ErrNoRows {
+		jsonError(w, "channel not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, "failed to get channel", http.StatusInternalServerError)
+		return
+	}
+	if ch.ServerID == nil || *ch.ServerID != serverID {
+		jsonError(w, "channel does not belong to this server", http.StatusBadRequest)
+		return
+	}
+
+	if err := channelRepo.DeleteChannel(r.Context(), channelID); err != nil {
+		jsonError(w, "failed to delete channel", http.StatusInternalServerError)
+		return
+	}
+
+	// Broadcast channel deletion to all connected clients.
+	out, err := json.Marshal(map[string]string{
+		"type":       "channel_delete",
+		"channel_id": channelID.String(),
+		"server_id":  serverID.String(),
+	})
+	if err == nil {
+		s.hub.BroadcastAll(out)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- Members ---
@@ -899,4 +1237,72 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Read State ---
+
+func (s *Server) handleMarkRead(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	channelID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		jsonError(w, "invalid channel id", http.StatusBadRequest)
+		return
+	}
+
+	rsRepo := &database.ReadStateRepo{DB: s.db}
+
+	// Find the latest message in this channel.
+	latestID, err := rsRepo.GetLatestMessageID(r.Context(), channelID)
+	if err != nil {
+		jsonError(w, "failed to get latest message", http.StatusInternalServerError)
+		return
+	}
+
+	if err := rsRepo.UpdateReadState(r.Context(), user.ID, channelID, latestID); err != nil {
+		jsonError(w, "failed to update read state", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUnreadCounts(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	serverID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		jsonError(w, "invalid server id", http.StatusBadRequest)
+		return
+	}
+
+	// Check membership.
+	memberRepo := &database.ServerMemberRepo{DB: s.db}
+	isMember, err := memberRepo.IsMember(r.Context(), user.ID, serverID)
+	if err != nil {
+		jsonError(w, "failed to check membership", http.StatusInternalServerError)
+		return
+	}
+	if !isMember {
+		jsonError(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	rsRepo := &database.ReadStateRepo{DB: s.db}
+	counts, err := rsRepo.GetUnreadCounts(r.Context(), user.ID, serverID)
+	if err != nil {
+		jsonError(w, "failed to get unread counts", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(counts)
 }
