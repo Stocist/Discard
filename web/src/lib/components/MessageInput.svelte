@@ -62,6 +62,29 @@
 		files = files.filter((_, i) => i !== index);
 	}
 
+	function handlePaste(e: ClipboardEvent) {
+		const items = e.clipboardData?.items;
+		if (!items) return;
+
+		const imageFiles: File[] = [];
+		for (const item of items) {
+			if (item.type.startsWith('image/')) {
+				const blob = item.getAsFile();
+				if (blob) {
+					const ext = blob.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+					const name = `pasted-image-${Date.now()}.${ext}`;
+					const file = new File([blob], name, { type: blob.type });
+					imageFiles.push(file);
+				}
+			}
+		}
+
+		if (imageFiles.length > 0) {
+			e.preventDefault();
+			files = [...files, ...imageFiles];
+		}
+	}
+
 	function handleDragOver(e: DragEvent) {
 		e.preventDefault();
 	}
@@ -92,6 +115,7 @@
 			placeholder="Message #{channelName}"
 			bind:value={content}
 			onkeydown={handleKeydown}
+			onpaste={handlePaste}
 			rows="1"
 			disabled={sending}
 		></textarea>

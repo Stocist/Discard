@@ -6,6 +6,7 @@
 
 	let previews = $state<string[]>([]);
 	let prevUrls: string[] = [];
+	let lightboxSrc = $state<string | null>(null);
 
 	$effect(() => {
 		// Track only `files` as dependency — avoid reading `previews` here.
@@ -29,13 +30,24 @@
 	}
 </script>
 
+{#if lightboxSrc}
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="lightbox-overlay" onclick={() => lightboxSrc = null}>
+		<img src={lightboxSrc} alt="Preview" class="lightbox-img" />
+	</div>
+{/if}
+
+<svelte:window onkeydown={(e) => { if (e.key === 'Escape') lightboxSrc = null; }} />
+
 {#if files.length > 0}
 	<div class="file-preview-strip">
 		{#each files as file, i (file.name + file.size + i)}
 			<div class="preview-item">
 				<button class="remove-btn" onclick={() => onRemove(i)} aria-label="Remove file">x</button>
 				{#if previews[i]}
-					<img class="preview-thumb" src={previews[i]} alt={file.name} />
+					<button class="thumb-btn" onclick={() => lightboxSrc = previews[i]} aria-label="Preview {file.name}">
+						<img class="preview-thumb" src={previews[i]} alt={file.name} />
+					</button>
 				{:else}
 					<div class="preview-file-icon">📎</div>
 				{/if}
@@ -118,5 +130,35 @@
 	.preview-size {
 		font-size: 10px;
 		color: var(--text-muted);
+	}
+
+	.thumb-btn {
+		background: none;
+		border: none;
+		padding: 0;
+		cursor: pointer;
+		border-radius: 6px;
+	}
+
+	.thumb-btn:hover .preview-thumb {
+		opacity: 0.8;
+	}
+
+	.lightbox-overlay {
+		position: fixed;
+		inset: 0;
+		background: rgba(0, 0, 0, 0.85);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		z-index: 1000;
+		cursor: pointer;
+	}
+
+	.lightbox-img {
+		max-width: 90vw;
+		max-height: 90vh;
+		object-fit: contain;
+		border-radius: 8px;
 	}
 </style>
