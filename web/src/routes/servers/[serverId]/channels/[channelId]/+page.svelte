@@ -113,7 +113,7 @@
 />
 
 {#if channelId}
-	<ChatView {channelId} {channelName} onToggleMembers={toggleMembers} />
+	<ChatView {channelId} {channelName} onToggleMembers={toggleMembers} ws={sharedWs} />
 {/if}
 
 <MemberSidebar {members} visible={showMembers} />

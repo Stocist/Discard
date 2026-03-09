@@ -2,7 +2,7 @@
 	import type { Message } from '$lib/types';
 	import { listMessages, editMessage, deleteMessage } from '$lib/api';
 	import { fetchMe } from '$lib/api';
-	import { createWSConnection, subscribe, unsubscribe, sendMessage } from '$lib/ws';
+	import { subscribe, unsubscribe, sendMessage } from '$lib/ws';
 	import { renderMarkdown } from '$lib/markdown';
 	import MessageInput from './MessageInput.svelte';
 	import AttachmentPreview from './AttachmentPreview.svelte';
@@ -22,10 +22,11 @@
 		return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
 	}
 
-	let { channelId, channelName, onToggleMembers }: {
+	let { channelId, channelName, onToggleMembers, ws }: {
 		channelId: string;
 		channelName: string;
 		onToggleMembers?: () => void;
+		ws?: WebSocket;
 	} = $props();
 
 	let messages = $state<Message[]>([]);
@@ -33,7 +34,6 @@
 	let loadingMore = $state(false);
 	let hasMore = $state(true);
 	let isAtBottom = $state(true);
-	let activeConn: WebSocket | undefined = $state();
 
 	// Current user ID for ownership checks
 	let currentUserId = $state<string | null>(null);
@@ -78,9 +78,10 @@
 		isAtBottom = scrollHeight - scrollTop - clientHeight < 40;
 	}
 
-	// Main effect: loads messages + manages WebSocket for the current channelId
+	// Main effect: loads messages + subscribes to channel on shared WebSocket
 	$effect(() => {
 		const cid = channelId;
+		const conn = ws;
 		let cancelled = false;
 
 		messages = [];
@@ -102,16 +103,21 @@
 			}
 		})();
 
-		// WebSocket
-		const conn = createWSConnection({ handleVoice: false });
-		activeConn = conn;
+		if (!conn) return;
 
-		conn.addEventListener('open', () => {
-			if (cancelled) { conn.close(); return; }
+		// Subscribe to channel on the shared WS
+		function doSubscribe() {
+			if (cancelled || !conn) return;
 			subscribe(conn, cid);
-		});
+		}
 
-		conn.addEventListener('message', (event) => {
+		if (conn.readyState === WebSocket.OPEN) {
+			doSubscribe();
+		} else {
+			conn.addEventListener('open', doSubscribe);
+		}
+
+		function handleMessage(event: MessageEvent) {
 			if (cancelled) return;
 			try {
 				const data = JSON.parse(event.data);
@@ -129,15 +135,19 @@
 			} catch {
 				// ignore
 			}
-		});
+		}
+
+		conn.addEventListener('message', handleMessage);
 
 		return () => {
 			cancelled = true;
-			activeConn = undefined;
-			if (conn.readyState === WebSocket.OPEN) {
-				unsubscribe(conn, cid);
+			if (conn) {
+				conn.removeEventListener('open', doSubscribe);
+				conn.removeEventListener('message', handleMessage);
+				if (conn.readyState === WebSocket.OPEN) {
+					unsubscribe(conn, cid);
+				}
 			}
-			conn.close();
 		};
 	});
 
@@ -163,8 +173,8 @@
 	}
 
 	function handleSend(content: string) {
-		if (activeConn && activeConn.readyState === WebSocket.OPEN) {
-			sendMessage(activeConn, channelId, content);
+		if (ws && ws.readyState === WebSocket.OPEN) {
+			sendMessage(ws, channelId, content);
 		}
 	}
 
