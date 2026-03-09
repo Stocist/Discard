@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/pion/webrtc/v4"
 )
 
 // SendToUserFunc sends raw JSON data to a specific connected user.
@@ -17,6 +19,8 @@ type Manager struct {
 	sessions   map[uuid.UUID]*VoiceSession
 	onEvent    func(data []byte) // broadcasts to all WS clients
 	sendToUser SendToUserFunc
+	stopSweep  chan struct{}
+	stopOnce   sync.Once
 }
 
 // NewManager creates a voice manager.
@@ -27,6 +31,67 @@ func NewManager(onEvent func([]byte), sendToUser SendToUserFunc) *Manager {
 		sessions:   make(map[uuid.UUID]*VoiceSession),
 		onEvent:    onEvent,
 		sendToUser: sendToUser,
+		stopSweep:  make(chan struct{}),
+	}
+}
+
+// StartSweeper runs a periodic goroutine that evicts participants whose
+// PeerConnection is in failed/closed/disconnected state.
+func (m *Manager) StartSweeper() {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				m.sweepStale()
+			case <-m.stopSweep:
+				return
+			}
+		}
+	}()
+}
+
+// StopSweeper stops the periodic stale session sweeper.
+func (m *Manager) StopSweeper() {
+	m.stopOnce.Do(func() {
+		close(m.stopSweep)
+	})
+}
+
+func (m *Manager) sweepStale() {
+	m.mu.RLock()
+	sessions := make(map[uuid.UUID]*VoiceSession, len(m.sessions))
+	for id, s := range m.sessions {
+		sessions[id] = s
+	}
+	m.mu.RUnlock()
+
+	for channelID, session := range sessions {
+		session.mu.RLock()
+		var staleUsers []uuid.UUID
+		for uid, p := range session.participants {
+			state := p.PC.ConnectionState()
+			if state == webrtc.PeerConnectionStateFailed ||
+				state == webrtc.PeerConnectionStateClosed {
+				staleUsers = append(staleUsers, uid)
+			}
+		}
+		session.mu.RUnlock()
+
+		for _, uid := range staleUsers {
+			log.Printf("voice: sweeper evicting stale user %s from channel %s", uid, channelID)
+			session.RemoveParticipant(uid)
+			m.broadcastVoiceState(channelID)
+		}
+
+		if session.IsEmpty() {
+			m.mu.Lock()
+			if session.IsEmpty() {
+				delete(m.sessions, channelID)
+			}
+			m.mu.Unlock()
+		}
 	}
 }
 
@@ -39,7 +104,16 @@ func (m *Manager) Join(channelID, userID uuid.UUID, username, avatarPath string)
 	m.mu.Lock()
 	session, ok := m.sessions[channelID]
 	if !ok {
-		session = NewVoiceSession(channelID, m.sendToUser, m.onEvent)
+		session = NewVoiceSession(channelID, m.sendToUser, m.onEvent, func(removedUserID uuid.UUID) {
+			m.broadcastVoiceState(channelID)
+			if session.IsEmpty() {
+				m.mu.Lock()
+				if session.IsEmpty() {
+					delete(m.sessions, channelID)
+				}
+				m.mu.Unlock()
+			}
+		})
 		m.sessions[channelID] = session
 	}
 	m.mu.Unlock()
@@ -132,14 +206,13 @@ func (m *Manager) DisconnectUser(userID uuid.UUID) {
 
 	for channelID, session := range sessions {
 		session.RemoveParticipant(userID)
+		m.broadcastVoiceState(channelID)
 		if session.IsEmpty() {
 			m.mu.Lock()
 			if session.IsEmpty() {
 				delete(m.sessions, channelID)
 			}
 			m.mu.Unlock()
-		} else {
-			m.broadcastVoiceState(channelID)
 		}
 	}
 }
@@ -157,6 +230,34 @@ func (m *Manager) GetAllVoiceStates() map[uuid.UUID][]ParticipantState {
 		}
 	}
 	return states
+}
+
+// StartScreenShare starts screen sharing for a user in a channel.
+// Returns true if successful, false if someone else is already sharing.
+func (m *Manager) StartScreenShare(channelID, userID uuid.UUID) bool {
+	m.mu.RLock()
+	session, ok := m.sessions[channelID]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	if session.StartScreenShare(userID) {
+		m.broadcastVoiceState(channelID)
+		return true
+	}
+	return false
+}
+
+// StopScreenShare stops screen sharing for a user in a channel.
+func (m *Manager) StopScreenShare(channelID, userID uuid.UUID) {
+	m.mu.RLock()
+	session, ok := m.sessions[channelID]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	session.StopScreenShare(userID)
+	m.broadcastVoiceState(channelID)
 }
 
 // broadcastVoiceState sends the current voice state for a channel to all clients.

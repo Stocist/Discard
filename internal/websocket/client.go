@@ -75,15 +75,18 @@ type VoiceHandler interface {
 	SetDeafened(channelID, userID uuid.UUID, deafened bool)
 	DisconnectUser(userID uuid.UUID)
 	GetAllVoiceStates() map[uuid.UUID][]VoiceParticipantState
+	StartScreenShare(channelID, userID uuid.UUID) bool
+	StopScreenShare(channelID, userID uuid.UUID)
 }
 
 // VoiceParticipantState is the WS-package view of a voice participant.
 type VoiceParticipantState struct {
-	UserID     uuid.UUID `json:"user_id"`
-	Username   string    `json:"username"`
-	AvatarPath string    `json:"avatar_path,omitempty"`
-	Muted      bool      `json:"muted"`
-	Deafened   bool      `json:"deafened"`
+	UserID        uuid.UUID `json:"user_id"`
+	Username      string    `json:"username"`
+	AvatarPath    string    `json:"avatar_path,omitempty"`
+	Muted         bool      `json:"muted"`
+	Deafened      bool      `json:"deafened"`
+	ScreenSharing bool      `json:"screen_sharing"`
 }
 
 // incomingMessage is the envelope for messages from the browser.
@@ -187,6 +190,10 @@ func (c *Client) ReadPump() {
 			c.handleVoiceSpeaking(msg)
 		case "voice_state_request":
 			c.handleVoiceStateRequest()
+		case "screen_share_start":
+			c.handleScreenShareStart(msg)
+		case "screen_share_stop":
+			c.handleScreenShareStop(msg)
 
 		default:
 			log.Printf("ws unknown message type: %s", msg.Type)
@@ -377,6 +384,48 @@ func (c *Client) handleVoiceStateRequest() {
 		return
 	}
 	c.hub.SendToClient(c, data)
+}
+
+func (c *Client) handleScreenShareStart(msg incomingMessage) {
+	if c.OnVoice == nil {
+		return
+	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		c.sendError("invalid channel_id")
+		return
+	}
+	ok := c.OnVoice.StartScreenShare(channelID, c.UserID)
+	if !ok {
+		c.sendError("someone else is already sharing their screen")
+		return
+	}
+	// Broadcast screen share start to all clients
+	data, _ := json.Marshal(map[string]interface{}{
+		"type":       "screen_share_started",
+		"channel_id": channelID.String(),
+		"user_id":    c.UserID.String(),
+		"username":   c.Username,
+	})
+	c.hub.BroadcastAll(data)
+}
+
+func (c *Client) handleScreenShareStop(msg incomingMessage) {
+	if c.OnVoice == nil {
+		return
+	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		return
+	}
+	c.OnVoice.StopScreenShare(channelID, c.UserID)
+	// Broadcast screen share stop to all clients
+	data, _ := json.Marshal(map[string]interface{}{
+		"type":       "screen_share_stopped",
+		"channel_id": channelID.String(),
+		"user_id":    c.UserID.String(),
+	})
+	c.hub.BroadcastAll(data)
 }
 
 func (c *Client) handleChatMessage(msg incomingMessage) {

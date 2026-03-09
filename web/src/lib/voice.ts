@@ -8,6 +8,7 @@ export interface VoiceParticipant {
 	muted: boolean;
 	deafened: boolean;
 	speaking: boolean;
+	screen_sharing: boolean;
 }
 
 // Module state (plain variables, NOT $state)
@@ -21,6 +22,15 @@ let listeners = new Set<() => void>();
 let speakingInterval: ReturnType<typeof setInterval> | null = null;
 let audioContext: AudioContext | null = null;
 let analyser: AnalyserNode | null = null;
+
+// Screen share state
+let screenStream: MediaStream | null = null;
+let screenSharing = false;
+let screenSharerUserId: string | null = null;
+let screenSharerUsername: string | null = null;
+let screenShareChannelId: string | null = null;
+let screenShareListeners = new Set<() => void>();
+let remoteScreenStream: MediaStream | null = null;
 
 // Error state — surfaced to UI
 let lastError: string | null = null;
@@ -50,7 +60,11 @@ export function subscribeVoiceError(fn: (msg: string | null) => void): () => voi
 
 function wsSend(ws: WebSocket, data: Record<string, unknown>) {
 	if (ws.readyState === WebSocket.OPEN) {
-		ws.send(JSON.stringify(data));
+		try {
+			ws.send(JSON.stringify(data));
+		} catch (e) {
+			console.warn('[voice] wsSend failed:', e);
+		}
 	}
 }
 
@@ -78,6 +92,10 @@ export function joinVoice(ws: WebSocket, channelId: string): void {
 
 export function leaveVoice(ws: WebSocket): void {
 	if (!currentChannelId) return;
+	// Stop screen share if active
+	if (screenSharing) {
+		stopScreenShare(ws);
+	}
 	wsSend(ws, { type: 'voice_leave', channel_id: currentChannelId });
 	stopSpeakingDetection();
 	if (pc) {
@@ -88,12 +106,18 @@ export function leaveVoice(ws: WebSocket): void {
 		localStream.getTracks().forEach(t => t.stop());
 		localStream = null;
 	}
-	// Clean up remote audio elements
+	// Clean up remote audio/video elements
 	document.querySelectorAll('audio[data-voice-remote]').forEach(el => el.remove());
+	document.querySelectorAll('audio[data-screen-audio]').forEach(el => el.remove());
+	remoteScreenStream = null;
+	screenSharerUserId = null;
+	screenSharerUsername = null;
+	screenShareChannelId = null;
 	currentChannelId = null;
 	muted = false;
 	deafened = false;
 	notify();
+	notifyScreenShare();
 }
 
 export function toggleMute(ws: WebSocket): void {
@@ -150,7 +174,161 @@ export function subscribeVoice(fn: () => void): () => void {
 	return () => listeners.delete(fn);
 }
 
-// Called from ws.ts for all voice_* messages
+// Screen share state accessors
+function notifyScreenShare() {
+	for (const fn of screenShareListeners) fn();
+}
+
+export function subscribeScreenShare(fn: () => void): () => void {
+	screenShareListeners.add(fn);
+	return () => screenShareListeners.delete(fn);
+}
+
+export function isScreenSharing(): boolean {
+	return screenSharing;
+}
+
+export function getScreenSharerUserId(): string | null {
+	return screenSharerUserId;
+}
+
+export function getScreenSharerUsername(): string | null {
+	return screenSharerUsername;
+}
+
+export function getScreenShareChannelId(): string | null {
+	return screenShareChannelId;
+}
+
+export function getRemoteScreenStream(): MediaStream | null {
+	return remoteScreenStream;
+}
+
+export async function startScreenShare(ws: WebSocket): Promise<void> {
+	if (!currentChannelId || !pc) {
+		setError('Must be in a voice channel to share screen');
+		return;
+	}
+	if (screenSharing) return;
+	if (!navigator.mediaDevices?.getDisplayMedia) {
+		setError('Screen sharing is not supported on this device');
+		return;
+	}
+
+	try {
+		screenStream = await navigator.mediaDevices.getDisplayMedia({
+			video: true,
+			audio: true
+		});
+
+		// Add screen share tracks to the existing PeerConnection
+		for (const track of screenStream.getTracks()) {
+			pc.addTrack(track, screenStream);
+		}
+
+		// Listen for user stopping share via browser UI
+		screenStream.getVideoTracks()[0]?.addEventListener('ended', () => {
+			stopScreenShare(ws);
+		});
+
+		// Some browsers interrupt getUserMedia when getDisplayMedia is called.
+		// Re-check mic track is still live; re-acquire if needed.
+		if (localStream && pc) {
+			const micTrack = localStream.getAudioTracks()[0];
+			if (!micTrack || micTrack.readyState === 'ended') {
+				try {
+					const newStream = await navigator.mediaDevices.getUserMedia({
+						audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+					});
+					localStream = newStream;
+					const newTrack = newStream.getAudioTracks()[0];
+					if (newTrack) {
+						newTrack.enabled = !muted;
+						// Find the sender that was carrying our voice audio and replace its track
+						const voiceSender = pc.getSenders().find(s =>
+							s.track === null || s.track === micTrack
+						);
+						if (voiceSender) {
+							await voiceSender.replaceTrack(newTrack);
+						}
+					}
+				} catch (_) { /* mic re-acquire failed, voice will be muted */ }
+			}
+		}
+
+		screenSharing = true;
+		wsSend(ws, { type: 'screen_share_start', channel_id: currentChannelId });
+		notify();
+		notifyScreenShare();
+	} catch (e) {
+		// User cancelled the picker — not an error
+		if (e instanceof DOMException && e.name === 'NotAllowedError') {
+			return;
+		}
+		const msg = e instanceof Error ? e.message : String(e);
+		setError('Screen share failed: ' + msg);
+	}
+}
+
+export function stopScreenShare(ws: WebSocket): void {
+	if (!screenSharing) return;
+
+	if (screenStream) {
+		// Remove screen share tracks from PeerConnection
+		if (pc) {
+			for (const track of screenStream.getTracks()) {
+				const sender = pc.getSenders().find(s => s.track === track);
+				if (sender) {
+					pc.removeTrack(sender);
+				}
+			}
+		}
+		screenStream.getTracks().forEach(t => t.stop());
+		screenStream = null;
+	}
+
+	screenSharing = false;
+	if (currentChannelId) {
+		wsSend(ws, { type: 'screen_share_stop', channel_id: currentChannelId });
+	}
+	notify();
+	notifyScreenShare();
+}
+
+// cleanupVoiceOnDisconnect handles ungraceful WS disconnect: cleans up audio elements,
+// PeerConnection, and local stream without trying to send WS messages.
+export function cleanupVoiceOnDisconnect(): void {
+	stopSpeakingDetection();
+	if (screenStream) {
+		screenStream.getTracks().forEach(t => t.stop());
+		screenStream = null;
+	}
+	screenSharing = false;
+	if (pc) {
+		pc.close();
+		pc = null;
+	}
+	if (localStream) {
+		localStream.getTracks().forEach(t => t.stop());
+		localStream = null;
+	}
+	// Remove all remote audio/video elements
+	document.querySelectorAll('audio[data-voice-remote]').forEach(el => el.remove());
+	document.querySelectorAll('audio[data-screen-audio]').forEach(el => el.remove());
+	remoteScreenStream = null;
+	screenSharerUserId = null;
+	screenSharerUsername = null;
+	screenShareChannelId = null;
+	if (currentChannelId) {
+		currentChannelId = null;
+		muted = false;
+		deafened = false;
+		notify();
+		notifyScreenShare();
+	}
+}
+
+// Called from ws.ts for all voice_* and screen_share_* messages
 export function handleVoiceMessage(ws: WebSocket, data: Record<string, unknown>): void {
 	switch (data.type) {
 		case 'voice_offer':
@@ -167,6 +345,12 @@ export function handleVoiceMessage(ws: WebSocket, data: Record<string, unknown>)
 			break;
 		case 'voice_speaking':
 			handleSpeaking(data);
+			break;
+		case 'screen_share_started':
+			handleScreenShareStarted(data);
+			break;
+		case 'screen_share_stopped':
+			handleScreenShareStopped(data);
 			break;
 	}
 }
@@ -300,19 +484,58 @@ async function handleOffer(ws: WebSocket, data: Record<string, unknown>) {
 
 		pc.ontrack = (event) => {
 			const stream = event.streams[0] ?? new MediaStream([event.track]);
-			console.log('[voice] ontrack: new remote track, stream id:', stream.id);
+			const trackId = event.track.id;
+			const streamId = stream.id;
+			console.log('[voice] ontrack: track kind=%s, stream id=%s, track id=%s', event.track.kind, streamId, trackId);
+
+			// Screen share tracks have stream ID starting with "screen-"
+			if (streamId.startsWith('screen-')) {
+				if (event.track.kind === 'video') {
+					// Create or update the remote screen stream
+					if (!remoteScreenStream) {
+						remoteScreenStream = new MediaStream();
+					}
+					remoteScreenStream.addTrack(event.track);
+					event.track.addEventListener('ended', () => {
+						if (remoteScreenStream) {
+							remoteScreenStream.removeTrack(event.track);
+							if (remoteScreenStream.getTracks().length === 0) {
+								remoteScreenStream = null;
+							}
+						}
+						notifyScreenShare();
+					});
+					notifyScreenShare();
+				} else if (event.track.kind === 'audio') {
+					// Screen share system audio — play it directly
+					if (remoteScreenStream) {
+						remoteScreenStream.addTrack(event.track);
+					}
+					const screenAudio = document.createElement('audio');
+					screenAudio.setAttribute('data-screen-audio', 'true');
+					screenAudio.autoplay = true;
+					screenAudio.srcObject = new MediaStream([event.track]);
+					document.body.appendChild(screenAudio);
+					screenAudio.play().catch(() => {});
+					event.track.addEventListener('ended', () => {
+						screenAudio.remove();
+					});
+				}
+				return;
+			}
+
+			// Regular voice audio track
 			// Deduplicate: if we already have an audio element for this stream, skip
-			const existing = document.querySelector(`audio[data-voice-stream="${stream.id}"]`);
+			const existing = document.querySelector(`audio[data-voice-stream="${streamId}"]`);
 			if (existing) return;
 
 			const audio = document.createElement('audio');
 			audio.setAttribute('data-voice-remote', 'true');
-			audio.setAttribute('data-voice-stream', stream.id);
+			audio.setAttribute('data-voice-stream', streamId);
 			audio.autoplay = true;
 			audio.srcObject = stream;
 			if (deafened) audio.muted = true;
 			document.body.appendChild(audio);
-			// Explicitly play to handle autoplay policy; ignore errors (user gesture propagation)
 			audio.play().catch(() => {});
 		};
 
@@ -320,7 +543,9 @@ async function handleOffer(ws: WebSocket, data: Record<string, unknown>) {
 		await pc.setRemoteDescription(new RTCSessionDescription(data.sdp as RTCSessionDescriptionInit));
 
 		// Get local audio
-		localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+		localStream = await navigator.mediaDevices.getUserMedia({
+			audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+		});
 		const audioTrack = localStream.getAudioTracks()[0];
 		if (audioTrack) {
 			audioTrack.enabled = !muted;
@@ -388,7 +613,9 @@ export async function startMicTest(onLevel: (level: number) => void): Promise<()
 		throw new Error('Mic not available — requires HTTPS or localhost');
 	}
 	console.log('[voice] starting mic test...');
-	const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+	const stream = await navigator.mediaDevices.getUserMedia({
+		audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+	});
 	console.log('[voice] mic test: got audio stream, tracks:', stream.getAudioTracks().length);
 	const ctx = new AudioContext();
 	const source = ctx.createMediaStreamSource(stream);
@@ -416,6 +643,25 @@ export async function startMicTest(onLevel: (level: number) => void): Promise<()
 		stream.getTracks().forEach(t => t.stop());
 		ctx.close().catch(() => {});
 	};
+}
+
+function handleScreenShareStarted(data: Record<string, unknown>) {
+	screenSharerUserId = data.user_id as string;
+	screenSharerUsername = data.username as string;
+	screenShareChannelId = data.channel_id as string;
+	notifyScreenShare();
+	notify();
+}
+
+function handleScreenShareStopped(_data: Record<string, unknown>) {
+	screenSharerUserId = null;
+	screenSharerUsername = null;
+	screenShareChannelId = null;
+	remoteScreenStream = null;
+	// Clean up screen audio elements
+	document.querySelectorAll('audio[data-screen-audio]').forEach(el => el.remove());
+	notifyScreenShare();
+	notify();
 }
 
 function handleSpeaking(data: Record<string, unknown>) {

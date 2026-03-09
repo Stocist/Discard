@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { toggleMute, toggleDeafen, leaveVoice, isMuted, isDeafened, isSelfSpeaking, getParticipants, subscribeVoice, getVoiceChannelId, startMicTest, getVoiceError, subscribeVoiceError } from '$lib/voice';
+	import { toggleMute, toggleDeafen, leaveVoice, isMuted, isDeafened, isSelfSpeaking, getParticipants, subscribeVoice, getVoiceChannelId, startMicTest, getVoiceError, subscribeVoiceError, startScreenShare, stopScreenShare, isScreenSharing, subscribeScreenShare, getScreenSharerUserId } from '$lib/voice';
 	import type { VoiceParticipant } from '$lib/voice';
 
 	let { ws, channelName }: {
@@ -66,6 +66,24 @@
 		micLevel = 0;
 	}
 
+	// Screen share state
+	const canScreenShare = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia;
+	let screenShareState = $state(0);
+	$effect(() => {
+		return subscribeScreenShare(() => { screenShareState++; });
+	});
+	const sharing = $derived.by(() => { screenShareState; return isScreenSharing(); });
+	const someoneSharing = $derived.by(() => { screenShareState; return getScreenSharerUserId() !== null; });
+
+	function handleScreenShare() {
+		if (!ws) return;
+		if (sharing) {
+			stopScreenShare(ws);
+		} else {
+			startScreenShare(ws);
+		}
+	}
+
 	function handleDisconnect() {
 		stopMicTest();
 		if (ws) leaveVoice(ws);
@@ -117,6 +135,19 @@
 		<div class="voice-error">{micTestError}</div>
 	{/if}
 	<div class="voice-controls">
+		{#if canScreenShare || someoneSharing}
+			<button
+				class="voice-btn"
+				class:active={sharing}
+				title={sharing ? 'Stop Sharing' : (!canScreenShare ? 'Screen sharing not supported' : (someoneSharing ? 'Someone is sharing' : 'Share Screen'))}
+				onclick={handleScreenShare}
+				disabled={!canScreenShare || (!sharing && someoneSharing)}
+			>
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+					<path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h7v2H8v2h8v-2h-2v-2h7c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z"/>
+				</svg>
+			</button>
+		{/if}
 		<button
 			class="voice-btn"
 			class:active={muted}
@@ -275,6 +306,11 @@
 	.voice-btn.active {
 		background: #dc2626;
 		color: white;
+	}
+
+	.voice-btn:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
 	}
 
 	.voice-btn.disconnect {

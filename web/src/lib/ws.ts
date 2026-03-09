@@ -1,4 +1,4 @@
-import { handleVoiceMessage } from './voice';
+import { handleVoiceMessage, cleanupVoiceOnDisconnect } from './voice';
 
 // Module-level presence state.
 // Use a callback pattern to notify subscribers since $state() only works in .svelte files.
@@ -76,10 +76,18 @@ export function createWSConnection(opts?: { handleVoice?: boolean }): WebSocket 
 		}
 	});
 
+	ws.addEventListener('close', () => {
+		if (handleVoice) cleanupVoiceOnDisconnect();
+	});
+
+	ws.addEventListener('error', () => {
+		if (handleVoice) cleanupVoiceOnDisconnect();
+	});
+
 	ws.addEventListener('message', (event) => {
 		try {
 			const data = JSON.parse(event.data);
-			if (data.type?.startsWith('voice_')) {
+			if (data.type?.startsWith('voice_') || data.type?.startsWith('screen_share_')) {
 				if (handleVoice) handleVoiceMessage(ws, data);
 			} else if (data.type === 'presence_update' || data.type === 'presence_list') {
 				handlePresenceMessage(data);

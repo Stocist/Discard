@@ -15,40 +15,51 @@ import (
 
 // ParticipantState is the public view of a voice participant.
 type ParticipantState struct {
-	UserID     uuid.UUID `json:"user_id"`
-	Username   string    `json:"username"`
-	AvatarPath string    `json:"avatar_path,omitempty"`
-	Muted      bool      `json:"muted"`
-	Deafened   bool      `json:"deafened"`
+	UserID        uuid.UUID `json:"user_id"`
+	Username      string    `json:"username"`
+	AvatarPath    string    `json:"avatar_path,omitempty"`
+	Muted         bool      `json:"muted"`
+	Deafened      bool      `json:"deafened"`
+	ScreenSharing bool      `json:"screen_sharing"`
 }
 
 // participant is the internal state for one user in a voice session.
 type participant struct {
-	UserID       uuid.UUID
-	Username     string
-	AvatarPath   string
-	PC           *webrtc.PeerConnection
-	Muted        bool
-	Deafened     bool
-	outputTracks map[uuid.UUID]*webrtc.TrackLocalStaticRTP // keyed by source user ID
+	UserID        uuid.UUID
+	Username      string
+	AvatarPath    string
+	PC            *webrtc.PeerConnection
+	Muted         bool
+	Deafened      bool
+	ScreenSharing bool
+	outputTracks  map[uuid.UUID]*webrtc.TrackLocalStaticRTP // keyed by source user ID
+	// Screen share output tracks forwarded to this participant from the sharer
+	screenVideoTracks map[uuid.UUID]*webrtc.TrackLocalStaticRTP
+	screenAudioTracks map[uuid.UUID]*webrtc.TrackLocalStaticRTP
+	// Recv transceivers added when this user starts screen sharing (cleaned up on stop)
+	screenRecvTransceivers []*webrtc.RTPTransceiver
+	renego                 sync.Mutex // serializes renegotiation per participant
 }
 
 // VoiceSession manages a single voice channel's WebRTC connections.
 type VoiceSession struct {
-	ChannelID    uuid.UUID
-	mu           sync.RWMutex
-	participants map[uuid.UUID]*participant
-	sendToUser   func(userID uuid.UUID, data []byte)
-	onEvent      func(data []byte)
+	ChannelID      uuid.UUID
+	mu             sync.RWMutex
+	participants   map[uuid.UUID]*participant
+	screenSharerID *uuid.UUID // who is currently screen sharing (nil = nobody)
+	sendToUser     func(userID uuid.UUID, data []byte)
+	onEvent        func(data []byte)
+	onRemove       func(userID uuid.UUID) // called when a participant is removed (ICE failure, etc.)
 }
 
 // NewVoiceSession creates a voice session for the given channel.
-func NewVoiceSession(channelID uuid.UUID, sendToUser func(uuid.UUID, []byte), onEvent func([]byte)) *VoiceSession {
+func NewVoiceSession(channelID uuid.UUID, sendToUser func(uuid.UUID, []byte), onEvent func([]byte), onRemove func(uuid.UUID)) *VoiceSession {
 	return &VoiceSession{
 		ChannelID:    channelID,
 		participants: make(map[uuid.UUID]*participant),
 		sendToUser:   sendToUser,
 		onEvent:      onEvent,
+		onRemove:     onRemove,
 	}
 }
 
@@ -63,6 +74,16 @@ func newMediaEngine() (*webrtc.MediaEngine, error) {
 		},
 		PayloadType: 111,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
+		return nil, err
+	}
+	// VP8 for screen sharing video
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:  webrtc.MimeTypeVP8,
+			ClockRate: 90000,
+		},
+		PayloadType: 96,
+	}, webrtc.RTPCodecTypeVideo); err != nil {
 		return nil, err
 	}
 	return m, nil
@@ -113,11 +134,13 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 	}
 
 	p := &participant{
-		UserID:       userID,
-		Username:     username,
-		AvatarPath:   avatarPath,
-		PC:           pc,
-		outputTracks: make(map[uuid.UUID]*webrtc.TrackLocalStaticRTP),
+		UserID:            userID,
+		Username:          username,
+		AvatarPath:        avatarPath,
+		PC:                pc,
+		outputTracks:      make(map[uuid.UUID]*webrtc.TrackLocalStaticRTP),
+		screenVideoTracks: make(map[uuid.UUID]*webrtc.TrackLocalStaticRTP),
+		screenAudioTracks: make(map[uuid.UUID]*webrtc.TrackLocalStaticRTP),
 	}
 
 	// Add a recv-only transceiver so the client sends us their audio
@@ -187,9 +210,25 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 	}
 
 	// OnTrack: forward incoming RTP to all other participants' output tracks
+	// Voice only uses audio. Video tracks are always screen share.
+	// When a user is screen sharing, their second audio track (system audio) is
+	// also forwarded as a screen track.
+	voiceAudioReceived := false
 	pc.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		log.Printf("voice: OnTrack fired for user %s, codec=%s", userID, remote.Codec().MimeType)
-		go s.forwardTrack(userID, remote)
+		codec := remote.Codec().MimeType
+		log.Printf("voice: OnTrack fired for user %s, codec=%s, streamID=%s, kind=%s", userID, codec, remote.StreamID(), remote.Kind())
+
+		if remote.Kind() == webrtc.RTPCodecTypeVideo {
+			// Video is always screen share (voice doesn't use video)
+			go s.forwardScreenTrack(userID, remote)
+		} else if remote.Kind() == webrtc.RTPCodecTypeAudio && !voiceAudioReceived {
+			// First audio track is voice
+			voiceAudioReceived = true
+			go s.forwardTrack(userID, remote)
+		} else {
+			// Subsequent audio tracks are screen share system audio
+			go s.forwardScreenTrack(userID, remote)
+		}
 	})
 
 	// OnICECandidate: send candidates to client
@@ -209,9 +248,32 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 		s.sendToUser(userID, data)
 	})
 
-	// OnTrack logging
+	// Connection state: evict on failed/closed, grace period on disconnected
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("voice: user %s PC state → %s", userID, state)
+		switch state {
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+			s.RemoveParticipant(userID)
+			if s.onRemove != nil {
+				s.onRemove(userID)
+			}
+		case webrtc.PeerConnectionStateDisconnected:
+			capturedP := p // capture pointer to detect rejoin
+			go func() {
+				time.Sleep(5 * time.Second)
+				s.mu.RLock()
+				currentP, ok := s.participants[userID]
+				s.mu.RUnlock()
+				// Only evict if same participant (not a rejoin) and still not connected
+				if ok && currentP == capturedP && currentP.PC.ConnectionState() != webrtc.PeerConnectionStateConnected {
+					log.Printf("voice: user %s still disconnected after grace period, removing", userID)
+					s.RemoveParticipant(userID)
+					if s.onRemove != nil {
+						s.onRemove(userID)
+					}
+				}
+			}()
+		}
 	})
 
 	s.participants[userID] = p
@@ -227,18 +289,29 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 
 	s.mu.Unlock()
 
+	// cleanupOnFailure removes the partially-added participant and renegotiates others
+	// to remove the output tracks that were added to their PCs.
+	cleanupOnFailure := func() {
+		s.mu.Lock()
+		s.removeParticipantLocked(p)
+		remaining := make(map[uuid.UUID]*participant, len(s.participants))
+		for id, op := range s.participants {
+			remaining[id] = op
+		}
+		s.mu.Unlock()
+		for id, op := range remaining {
+			s.renegotiate(id, op)
+		}
+	}
+
 	// Create SDP offer outside the lock — ICE gathering needs signaling to work
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
-		s.mu.Lock()
-		s.removeParticipantLocked(p)
-		s.mu.Unlock()
+		cleanupOnFailure()
 		return nil, err
 	}
 	if err := pc.SetLocalDescription(offer); err != nil {
-		s.mu.Lock()
-		s.removeParticipantLocked(p)
-		s.mu.Unlock()
+		cleanupOnFailure()
 		return nil, err
 	}
 
@@ -252,9 +325,7 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 
 	sdp, err := json.Marshal(pc.LocalDescription())
 	if err != nil {
-		s.mu.Lock()
-		s.removeParticipantLocked(p)
-		s.mu.Unlock()
+		cleanupOnFailure()
 		return nil, err
 	}
 
@@ -271,7 +342,25 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 func (s *VoiceSession) forwardTrack(sourceUserID uuid.UUID, remote *webrtc.TrackRemote) {
 	buf := make([]byte, 1500)
 	packets := 0
+
+	// Grab a reference to the participant's PC so we can check its state
+	s.mu.RLock()
+	p, ok := s.participants[sourceUserID]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	srcPC := p.PC
+
 	for {
+		// Exit if the PeerConnection is no longer connected
+		state := srcPC.ConnectionState()
+		if state == webrtc.PeerConnectionStateFailed ||
+			state == webrtc.PeerConnectionStateClosed {
+			log.Printf("voice: forwardTrack exiting for user %s, PC state=%s, packets=%d", sourceUserID, state, packets)
+			return
+		}
+
 		n, _, err := remote.Read(buf)
 		if err != nil {
 			log.Printf("voice: forwardTrack ended for user %s after %d packets: %v", sourceUserID, packets, err)
@@ -360,6 +449,10 @@ func (s *VoiceSession) RemoveParticipant(userID uuid.UUID) {
 
 // removeParticipantLocked closes a participant's PC and cleans up. Caller holds s.mu.
 func (s *VoiceSession) removeParticipantLocked(p *participant) {
+	// If this participant was the screen sharer, clear it
+	if s.screenSharerID != nil && *s.screenSharerID == p.UserID {
+		s.screenSharerID = nil
+	}
 	p.PC.Close()
 	// Remove output tracks and RTPSenders that other participants have for this user
 	for _, other := range s.participants {
@@ -372,13 +465,42 @@ func (s *VoiceSession) removeParticipantLocked(p *participant) {
 			}
 			delete(other.outputTracks, p.UserID)
 		}
+		// Remove screen share tracks
+		s.removeScreenTracksFromParticipant(other, p.UserID)
 	}
 	delete(s.participants, p.UserID)
 }
 
+// removeScreenTracksFromParticipant removes screen share video/audio tracks
+// for a given sharer from a viewer's PC. Caller holds s.mu.
+func (s *VoiceSession) removeScreenTracksFromParticipant(viewer *participant, sharerID uuid.UUID) {
+	if track, has := viewer.screenVideoTracks[sharerID]; has {
+		for _, sender := range viewer.PC.GetSenders() {
+			if sender.Track() == track {
+				viewer.PC.RemoveTrack(sender)
+				break
+			}
+		}
+		delete(viewer.screenVideoTracks, sharerID)
+	}
+	if track, has := viewer.screenAudioTracks[sharerID]; has {
+		for _, sender := range viewer.PC.GetSenders() {
+			if sender.Track() == track {
+				viewer.PC.RemoveTrack(sender)
+				break
+			}
+		}
+		delete(viewer.screenAudioTracks, sharerID)
+	}
+}
+
 // renegotiate creates a new offer and sends it to the participant.
 // Must NOT be called while holding s.mu — ICE gathering needs the lock free.
+// Uses per-participant mutex to prevent concurrent renegotiation race conditions.
 func (s *VoiceSession) renegotiate(userID uuid.UUID, p *participant) {
+	p.renego.Lock()
+	defer p.renego.Unlock()
+
 	offer, err := p.PC.CreateOffer(nil)
 	if err != nil {
 		log.Printf("voice: renegotiate offer error for %s: %v", userID, err)
@@ -439,11 +561,12 @@ func (s *VoiceSession) Participants() []ParticipantState {
 	states := make([]ParticipantState, 0, len(s.participants))
 	for _, p := range s.participants {
 		states = append(states, ParticipantState{
-			UserID:     p.UserID,
-			Username:   p.Username,
-			AvatarPath: p.AvatarPath,
-			Muted:      p.Muted,
-			Deafened:   p.Deafened,
+			UserID:        p.UserID,
+			Username:      p.Username,
+			AvatarPath:    p.AvatarPath,
+			Muted:         p.Muted,
+			Deafened:      p.Deafened,
+			ScreenSharing: p.ScreenSharing,
 		})
 	}
 	return states
@@ -454,4 +577,235 @@ func (s *VoiceSession) IsEmpty() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.participants) == 0
+}
+
+// ScreenSharerID returns the user ID of the current screen sharer, or nil.
+func (s *VoiceSession) ScreenSharerID() *uuid.UUID {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.screenSharerID
+}
+
+// StartScreenShare marks a user as screen sharing and sets up receive transceivers
+// for the screen video+audio, plus output tracks to all other participants.
+// Returns true if successful, false if someone else is already sharing.
+func (s *VoiceSession) StartScreenShare(userID uuid.UUID) bool {
+	s.mu.Lock()
+
+	// Only one screen share at a time
+	if s.screenSharerID != nil && *s.screenSharerID != userID {
+		s.mu.Unlock()
+		return false
+	}
+
+	p, ok := s.participants[userID]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+
+	id := userID
+	s.screenSharerID = &id
+	p.ScreenSharing = true
+
+	// Add recv-only transceivers for screen video and screen audio
+	videoTr, err := p.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	})
+	if err != nil {
+		log.Printf("voice: screen share add video transceiver error: %v", err)
+		s.screenSharerID = nil
+		p.ScreenSharing = false
+		s.mu.Unlock()
+		return false
+	}
+	audioTr, err := p.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	})
+	if err != nil {
+		log.Printf("voice: screen share add audio transceiver error: %v", err)
+		s.screenSharerID = nil
+		p.ScreenSharing = false
+		s.mu.Unlock()
+		return false
+	}
+	p.screenRecvTransceivers = []*webrtc.RTPTransceiver{videoTr, audioTr}
+
+	// Create output tracks on all other participants for screen video+audio
+	for otherID, other := range s.participants {
+		if otherID == userID {
+			continue
+		}
+		s.addScreenOutputTracks(other, userID)
+	}
+
+	// Collect all participants for renegotiation
+	allParticipants := make(map[uuid.UUID]*participant, len(s.participants))
+	for id, p := range s.participants {
+		allParticipants[id] = p
+	}
+	s.mu.Unlock()
+
+	// Renegotiate all participants (sharer needs recv transceivers, viewers need send)
+	for id, p := range allParticipants {
+		s.renegotiate(id, p)
+	}
+
+	return true
+}
+
+// addScreenOutputTracks creates sendonly video+audio tracks on viewer's PC for screen share.
+// Caller must hold s.mu.
+func (s *VoiceSession) addScreenOutputTracks(viewer *participant, sharerID uuid.UUID) {
+	// Video track
+	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
+		"screen-video-"+sharerID.String(),
+		"screen-"+s.ChannelID.String(),
+	)
+	if err != nil {
+		log.Printf("voice: create screen video track error: %v", err)
+		return
+	}
+	vt, err := viewer.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	})
+	if err != nil {
+		log.Printf("voice: add screen video transceiver error: %v", err)
+		return
+	}
+	if err := vt.Sender().ReplaceTrack(videoTrack); err != nil {
+		log.Printf("voice: replace screen video track error: %v", err)
+		return
+	}
+	viewer.screenVideoTracks[sharerID] = videoTrack
+
+	// Audio track (system audio from screen share)
+	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		"screen-audio-"+sharerID.String(),
+		"screen-"+s.ChannelID.String(),
+	)
+	if err != nil {
+		log.Printf("voice: create screen audio track error: %v", err)
+		return
+	}
+	at, err := viewer.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	})
+	if err != nil {
+		log.Printf("voice: add screen audio transceiver error: %v", err)
+		return
+	}
+	if err := at.Sender().ReplaceTrack(audioTrack); err != nil {
+		log.Printf("voice: replace screen audio track error: %v", err)
+		return
+	}
+	viewer.screenAudioTracks[sharerID] = audioTrack
+}
+
+// StopScreenShare stops screen sharing for a user.
+func (s *VoiceSession) StopScreenShare(userID uuid.UUID) {
+	s.mu.Lock()
+
+	if s.screenSharerID == nil || *s.screenSharerID != userID {
+		s.mu.Unlock()
+		return
+	}
+
+	p, ok := s.participants[userID]
+	if ok {
+		p.ScreenSharing = false
+		// Stop and clean up recv transceivers on the sharer's PC
+		for _, tr := range p.screenRecvTransceivers {
+			if err := tr.Stop(); err != nil {
+				log.Printf("voice: stop screen transceiver error: %v", err)
+			}
+		}
+		p.screenRecvTransceivers = nil
+	}
+	s.screenSharerID = nil
+
+	// Remove screen share output tracks from all viewers
+	for otherID, other := range s.participants {
+		if otherID == userID {
+			continue
+		}
+		s.removeScreenTracksFromParticipant(other, userID)
+	}
+
+	// Collect all participants for renegotiation (including sharer)
+	allParticipants := make(map[uuid.UUID]*participant, len(s.participants))
+	for id, p := range s.participants {
+		allParticipants[id] = p
+	}
+	s.mu.Unlock()
+
+	// Renegotiate all participants (sharer to remove recv, viewers to remove send)
+	for id, p := range allParticipants {
+		s.renegotiate(id, p)
+	}
+}
+
+// forwardScreenTrack reads RTP from a screen share remote track and writes
+// to all other participants' screen output tracks.
+func (s *VoiceSession) forwardScreenTrack(sourceUserID uuid.UUID, remote *webrtc.TrackRemote) {
+	isVideo := remote.Kind() == webrtc.RTPCodecTypeVideo
+	label := "screen-audio"
+	if isVideo {
+		label = "screen-video"
+	}
+
+	bufSize := 1500
+	if isVideo {
+		bufSize = 4096 // VP8 keyframes can exceed standard MTU
+	}
+	buf := make([]byte, bufSize)
+	packets := 0
+
+	s.mu.RLock()
+	p, ok := s.participants[sourceUserID]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	srcPC := p.PC
+
+	for {
+		state := srcPC.ConnectionState()
+		if state == webrtc.PeerConnectionStateFailed ||
+			state == webrtc.PeerConnectionStateClosed {
+			log.Printf("voice: %s forwardTrack exiting for user %s, PC state=%s, packets=%d", label, sourceUserID, state, packets)
+			return
+		}
+
+		n, _, err := remote.Read(buf)
+		if err != nil {
+			log.Printf("voice: %s forwardTrack ended for user %s after %d packets: %v", label, sourceUserID, packets, err)
+			return
+		}
+		packets++
+		if packets == 1 || packets%500 == 0 {
+			log.Printf("voice: forwarding %s RTP from %s, packet #%d, size=%d bytes", label, sourceUserID, packets, n)
+		}
+
+		s.mu.RLock()
+		for otherID, other := range s.participants {
+			if otherID == sourceUserID {
+				continue
+			}
+			var track *webrtc.TrackLocalStaticRTP
+			if isVideo {
+				track = other.screenVideoTracks[sourceUserID]
+			} else {
+				track = other.screenAudioTracks[sourceUserID]
+			}
+			if track != nil {
+				if _, writeErr := track.Write(buf[:n]); writeErr != nil {
+					log.Printf("voice: write %s track error: %v", label, writeErr)
+				}
+			}
+		}
+		s.mu.RUnlock()
+	}
 }

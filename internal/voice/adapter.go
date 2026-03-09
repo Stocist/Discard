@@ -46,6 +46,14 @@ func (a *Adapter) DisconnectUser(userID uuid.UUID) {
 	a.mgr.DisconnectUser(userID)
 }
 
+func (a *Adapter) StartScreenShare(channelID, userID uuid.UUID) bool {
+	return a.mgr.StartScreenShare(channelID, userID)
+}
+
+func (a *Adapter) StopScreenShare(channelID, userID uuid.UUID) {
+	a.mgr.StopScreenShare(channelID, userID)
+}
+
 func (a *Adapter) GetAllVoiceStates() map[uuid.UUID][]ws.VoiceParticipantState {
 	raw := a.mgr.GetAllVoiceStates()
 	result := make(map[uuid.UUID][]ws.VoiceParticipantState, len(raw))
@@ -53,11 +61,12 @@ func (a *Adapter) GetAllVoiceStates() map[uuid.UUID][]ws.VoiceParticipantState {
 		wsParticipants := make([]ws.VoiceParticipantState, len(participants))
 		for i, p := range participants {
 			wsParticipants[i] = ws.VoiceParticipantState{
-				UserID:     p.UserID,
-				Username:   p.Username,
-				AvatarPath: p.AvatarPath,
-				Muted:      p.Muted,
-				Deafened:   p.Deafened,
+				UserID:        p.UserID,
+				Username:      p.Username,
+				AvatarPath:    p.AvatarPath,
+				Muted:         p.Muted,
+				Deafened:      p.Deafened,
+				ScreenSharing: p.ScreenSharing,
 			}
 		}
 		result[channelID] = wsParticipants

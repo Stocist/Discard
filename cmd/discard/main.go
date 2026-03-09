@@ -48,6 +48,7 @@ func main() {
 		hub.SendToUser(userID, data)
 	}
 	voiceMgr := voice.NewManager(hub.BroadcastAll, sendToUser)
+	voiceMgr.StartSweeper()
 	voiceAdapter := voice.NewAdapter(voiceMgr)
 
 	srv := server.NewServer(db, hub, voiceAdapter)
