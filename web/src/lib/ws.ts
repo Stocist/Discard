@@ -1,3 +1,5 @@
+import { handleVoiceMessage } from './voice';
+
 // Module-level presence state.
 // Use a callback pattern to notify subscribers since $state() only works in .svelte files.
 let onlineSet = new Set<string>();
@@ -62,18 +64,24 @@ export function subscribeUnread(fn: UnreadHandler): () => void {
 	return () => unreadListeners.delete(fn);
 }
 
-export function createWSConnection(): WebSocket {
+export function createWSConnection(opts?: { handleVoice?: boolean }): WebSocket {
+	const handleVoice = opts?.handleVoice ?? true;
 	const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 	const ws = new WebSocket(`${protocol}//${location.host}/api/ws`);
 
 	ws.addEventListener('open', () => {
 		ws.send(JSON.stringify({ type: 'presence_request' }));
+		if (handleVoice) {
+			ws.send(JSON.stringify({ type: 'voice_state_request' }));
+		}
 	});
 
 	ws.addEventListener('message', (event) => {
 		try {
 			const data = JSON.parse(event.data);
-			if (data.type === 'presence_update' || data.type === 'presence_list') {
+			if (data.type?.startsWith('voice_')) {
+				if (handleVoice) handleVoiceMessage(ws, data);
+			} else if (data.type === 'presence_update' || data.type === 'presence_list') {
 				handlePresenceMessage(data);
 			} else if (data.type === 'server_update' || data.type === 'server_delete') {
 				handleServerMessage(data);

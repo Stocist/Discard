@@ -2,7 +2,8 @@
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { getServer, listChannels, listMembers, fetchMe, getUnreadCounts, markChannelRead } from '$lib/api';
-	import { subscribeUnread } from '$lib/ws';
+	import { subscribeUnread, createWSConnection } from '$lib/ws';
+	import { leaveVoice, getVoiceChannelId } from '$lib/voice';
 	import type { Channel, Server, ServerMember, User } from '$lib/types';
 	import ChannelSidebar from '$lib/components/ChannelSidebar.svelte';
 	import ChatView from '$lib/components/ChatView.svelte';
@@ -18,6 +19,20 @@
 	let currentUser = $state<User | null>(null);
 	let unreadCounts = $state<Record<string, number>>({});
 	let showMembers = $state(true);
+	let sharedWs = $state<WebSocket | undefined>(undefined);
+
+	// Shared WebSocket for voice and sidebar features
+	$effect(() => {
+		const conn = createWSConnection();
+		sharedWs = conn;
+		return () => {
+			if (getVoiceChannelId() && conn.readyState === WebSocket.OPEN) {
+				leaveVoice(conn);
+			}
+			sharedWs = undefined;
+			conn.close();
+		};
+	});
 
 	const currentUserId = $derived(currentUser?.id ?? '');
 	const isOwner = $derived(!!server && currentUserId === server.owner_id);
@@ -94,6 +109,7 @@
 	onserverdelete={handleServerDelete}
 	{unreadCounts}
 	bind:currentUser
+	ws={sharedWs}
 />
 
 {#if channelId}

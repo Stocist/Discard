@@ -103,7 +103,7 @@
 		})();
 
 		// WebSocket
-		const conn = createWSConnection();
+		const conn = createWSConnection({ handleVoice: false });
 		activeConn = conn;
 
 		conn.addEventListener('open', () => {

@@ -6,8 +6,10 @@
 	import ServerSettings from './ServerSettings.svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import UserProfile from './UserProfile.svelte';
+	import VoicePanel from './VoicePanel.svelte';
+	import { joinVoice, getVoiceChannelId, getParticipants, subscribeVoice, getVoiceError, subscribeVoiceError } from '$lib/voice';
 
-	let { serverId, channels = $bindable(), serverName = $bindable(), server = $bindable(), isOwner = false, onserverdelete, unreadCounts = {}, currentUser = $bindable() }: {
+	let { serverId, channels = $bindable(), serverName = $bindable(), server = $bindable(), isOwner = false, onserverdelete, unreadCounts = {}, currentUser = $bindable(), ws }: {
 		serverId: string;
 		channels: Channel[];
 		serverName: string;
@@ -16,12 +18,65 @@
 		onserverdelete?: () => void;
 		unreadCounts?: Record<string, number>;
 		currentUser?: User | null;
+		ws?: WebSocket;
 	} = $props();
 
 	let showSettings = $state(false);
 	let showProfile = $state(false);
 
 	const currentChannelId = $derived(page.params?.channelId ?? '');
+
+	// Split channels by type
+	const textChannels = $derived(channels.filter(c => c.type !== 'voice'));
+	const voiceChannels = $derived(channels.filter(c => c.type === 'voice'));
+
+	// Voice state subscription (callback pattern for reactivity)
+	let voiceState = $state(0);
+	$effect(() => {
+		return subscribeVoice(() => { voiceState++; });
+	});
+	const voiceChannelId = $derived.by(() => { voiceState; return getVoiceChannelId(); });
+	const connectedVoiceChannel = $derived(voiceChannelId ? channels.find(c => c.id === voiceChannelId) : null);
+
+	// Voice error display
+	let voiceError = $state<string | null>(null);
+	$effect(() => {
+		voiceError = getVoiceError();
+		return subscribeVoiceError((msg) => { voiceError = msg; });
+	});
+
+	// Voice channel creation
+	let showNewVoiceChannel = $state(false);
+	let newVoiceChannelName = $state('');
+	let creatingVoiceChannel = $state(false);
+
+	async function handleCreateVoiceChannel() {
+		const name = newVoiceChannelName.trim();
+		if (!name || creatingVoiceChannel) return;
+		creatingVoiceChannel = true;
+		try {
+			const ch = await createChannel(serverId, name, 'voice');
+			channels = [...channels, ch];
+			newVoiceChannelName = '';
+			showNewVoiceChannel = false;
+		} catch (e) {
+			console.error('Failed to create voice channel:', e);
+		} finally {
+			creatingVoiceChannel = false;
+		}
+	}
+
+	function handleNewVoiceChannelKeydown(e: KeyboardEvent) {
+		if (e.key === 'Enter') handleCreateVoiceChannel();
+		if (e.key === 'Escape') {
+			showNewVoiceChannel = false;
+			newVoiceChannelName = '';
+		}
+	}
+
+	function handleJoinVoice(channelId: string) {
+		if (ws) joinVoice(ws, channelId);
+	}
 
 	// Open settings modal when ?settings=1 is in the URL (from ServerSidebar context menu)
 	$effect(() => {
@@ -194,7 +249,7 @@
 				/>
 			</div>
 		{/if}
-		{#each channels as channel (channel.id)}
+		{#each textChannels as channel (channel.id)}
 			{@const unread = unreadCounts[channel.id] ?? 0}
 			<div class="channel-row">
 				<button
@@ -217,7 +272,73 @@
 				>&times;</button>
 			</div>
 		{/each}
+
+		<div class="category-header">
+			<span class="category-label">VOICE CHANNELS</span>
+			<button
+				class="add-channel-btn"
+				title="Create Voice Channel"
+				onclick={() => { showNewVoiceChannel = !showNewVoiceChannel; }}
+			>+</button>
+		</div>
+		{#if showNewVoiceChannel}
+			<div class="new-channel-input">
+				<svg class="voice-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+					<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+				</svg>
+				<input
+					type="text"
+					placeholder="new-voice-channel"
+					maxlength="100"
+					bind:value={newVoiceChannelName}
+					onkeydown={handleNewVoiceChannelKeydown}
+					disabled={creatingVoiceChannel}
+				/>
+			</div>
+		{/if}
+		{#each voiceChannels as channel (channel.id)}
+			{@const vcParticipants = (() => { voiceState; return getParticipants(channel.id); })()}
+			<div class="channel-row">
+				<button
+					class="channel voice-channel"
+					class:active={voiceChannelId === channel.id}
+					onclick={() => handleJoinVoice(channel.id)}
+					oncontextmenu={(e) => handleChannelContextMenu(e, channel.id)}
+				>
+					<svg class="voice-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+						<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+					</svg>
+					<span class="channel-name">{channel.name ?? 'unnamed'}</span>
+				</button>
+				<button
+					class="delete-channel-btn"
+					title="Delete Channel"
+					onclick={(e) => { e.stopPropagation(); confirmDeleteId = channel.id; }}
+				>&times;</button>
+			</div>
+			{#if vcParticipants.length > 0}
+				<div class="voice-participants-inline">
+					{#each vcParticipants as p (p.user_id)}
+						<div class="voice-participant-inline" class:speaking={p.speaking}>
+							{#if p.avatar_path}
+								<img class="voice-inline-avatar" src="/uploads/{p.avatar_path}" alt="" />
+							{:else}
+								<span class="voice-inline-avatar voice-inline-avatar-fallback">{(p.username ?? '?').charAt(0).toUpperCase()}</span>
+							{/if}
+							<span class="voice-inline-name">{p.username ?? 'Unknown'}</span>
+						</div>
+					{/each}
+				</div>
+			{/if}
+		{/each}
+		{#if voiceError && !voiceChannelId}
+			<div class="voice-join-error">{voiceError}</div>
+		{/if}
 	</div>
+
+	{#if connectedVoiceChannel && ws}
+		<VoicePanel {ws} channelName={connectedVoiceChannel.name ?? 'Voice'} />
+	{/if}
 
 	{#if currentUser}
 		<button class="user-panel" onclick={() => (showProfile = true)}>
@@ -643,6 +764,68 @@
 		font-size: 14px;
 		font-family: inherit;
 		margin-bottom: 16px;
+	}
+
+	.voice-join-error {
+		font-size: 11px;
+		color: #ef4444;
+		padding: 4px 16px;
+		line-height: 1.3;
+	}
+
+	.voice-icon {
+		opacity: 0.7;
+		flex-shrink: 0;
+	}
+
+	.voice-channel {
+		gap: 6px;
+	}
+
+	.voice-participants-inline {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		margin: 0 8px 2px 28px;
+	}
+
+	.voice-participant-inline {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 2px 8px;
+		border-radius: 4px;
+	}
+
+	.voice-participant-inline.speaking .voice-inline-avatar {
+		box-shadow: 0 0 0 2px var(--accent);
+	}
+
+	.voice-inline-avatar {
+		width: 18px;
+		height: 18px;
+		border-radius: 50%;
+		object-fit: cover;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		transition: box-shadow 0.15s;
+	}
+
+	.voice-inline-avatar-fallback {
+		background: var(--bg-tertiary);
+		color: var(--text-muted);
+		font-size: 9px;
+		font-weight: 600;
+	}
+
+	.voice-inline-name {
+		font-size: 12px;
+		color: var(--text-muted);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 
 	@media (max-width: 768px) {
