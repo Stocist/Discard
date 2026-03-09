@@ -19,6 +19,8 @@ import (
 type UserRepo interface {
 	GetByTailscaleID(ctx context.Context, tailscaleID string) (*models.User, error)
 	Create(ctx context.Context, user *models.User) error
+	// DevAutoJoinServers adds a user to all existing servers (dev mode only).
+	DevAutoJoinServers(ctx context.Context, userID uuid.UUID) error
 }
 
 // tailscaleWhoisResponse is the subset of the Tailscale localapi whois response we care about.
@@ -31,8 +33,13 @@ type tailscaleWhoisResponse struct {
 	} `json:"UserProfile"`
 }
 
-// devUser is the fixed user returned when DISCARD_DEV=true.
-var devUserID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
+// devUserIDs maps dev user numbers to fixed UUIDs for multi-user testing.
+var devUserIDs = [...]uuid.UUID{
+	uuid.MustParse("00000000-0000-0000-0000-000000000001"),
+	uuid.MustParse("00000000-0000-0000-0000-000000000002"),
+	uuid.MustParse("00000000-0000-0000-0000-000000000003"),
+	uuid.MustParse("00000000-0000-0000-0000-000000000004"),
+}
 
 // Middleware returns an http.Handler that authenticates every request via
 // the Tailscale local API (or a hardcoded dev user when DISCARD_DEV=true).
@@ -61,7 +68,17 @@ func Middleware(repo UserRepo) func(http.Handler) http.Handler {
 			var err error
 
 			if devMode {
-				user, err = devUser(ctx, repo)
+				// Set dev_user cookie when query param is present
+				if q := r.URL.Query().Get("dev_user"); q != "" {
+					http.SetCookie(w, &http.Cookie{
+						Name:     "dev_user",
+						Value:    q,
+						Path:     "/",
+						MaxAge:   86400,
+						HttpOnly: true,
+					})
+				}
+				user, err = devUser(ctx, repo, r)
 			} else {
 				user, err = tailscaleAuth(ctx, repo, client, r.RemoteAddr, tsAPIURL, tsAPIToken)
 			}
@@ -77,19 +94,44 @@ func Middleware(repo UserRepo) func(http.Handler) http.Handler {
 	}
 }
 
-// devUser returns (or auto-creates) a hardcoded dev user.
-func devUser(ctx context.Context, repo UserRepo) (*models.User, error) {
+// devUser returns (or auto-creates) a dev user.
+// Supports multiple dev users via ?dev_user=N query param (0-3) or dev_user cookie.
+// Default is user 0. Access /login?dev_user=1 from a second device to get a different identity.
+func devUser(ctx context.Context, repo UserRepo, r *http.Request) (*models.User, error) {
+	idx := 0
+	// Check query param first, then cookie
+	if q := r.URL.Query().Get("dev_user"); q != "" {
+		if n := q[0] - '0'; n >= 0 && n < byte(len(devUserIDs)) {
+			idx = int(n)
+			// Set cookie so subsequent requests (WS, API) use the same user
+		}
+	} else if c, err := r.Cookie("dev_user"); err == nil {
+		if n := c.Value[0] - '0'; n >= 0 && n < byte(len(devUserIDs)) {
+			idx = int(n)
+		}
+	}
+
+	names := [...]string{"Dev", "Alice", "Bob", "Charlie"}
+	// idx 0 keeps the original "dev-local" for backwards compat with existing DB rows
 	tsID := "dev-local"
+	if idx > 0 {
+		tsID = fmt.Sprintf("dev-local-%d", idx)
+	}
+
 	u, err := repo.GetByTailscaleID(ctx, tsID)
 	if err == nil {
+		// Idempotent — ensure dev user is a member of all servers (ON CONFLICT DO NOTHING)
+		if err := repo.DevAutoJoinServers(ctx, u.ID); err != nil {
+			log.Printf("dev: auto-join servers: %v", err)
+		}
 		return u, nil
 	}
 
-	displayName := "Dev User"
+	displayName := names[idx]
 	now := time.Now()
 	u = &models.User{
-		ID:          devUserID,
-		Username:    "devuser",
+		ID:          devUserIDs[idx],
+		Username:    strings.ToLower(displayName),
 		DisplayName: &displayName,
 		TailscaleID: &tsID,
 		Status:      "online",
@@ -98,6 +140,10 @@ func devUser(ctx context.Context, repo UserRepo) (*models.User, error) {
 	}
 	if err := repo.Create(ctx, u); err != nil {
 		return nil, fmt.Errorf("create dev user: %w", err)
+	}
+	// Auto-join all existing servers so the new dev user can test immediately
+	if err := repo.DevAutoJoinServers(ctx, u.ID); err != nil {
+		log.Printf("dev: auto-join servers: %v", err)
 	}
 	return u, nil
 }

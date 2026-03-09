@@ -55,6 +55,16 @@ func (r *UserRepo) GetByTailscaleID(ctx context.Context, tsID string) (*models.U
 	return u, nil
 }
 
+// DevAutoJoinServers adds a user to all existing servers (dev mode convenience).
+func (r *UserRepo) DevAutoJoinServers(ctx context.Context, userID uuid.UUID) error {
+	_, err := r.DB.ExecContext(ctx,
+		`INSERT INTO server_members (user_id, server_id, joined_at)
+		 SELECT $1, id, NOW() FROM servers
+		 ON CONFLICT DO NOTHING`, userID,
+	)
+	return err
+}
+
 func (r *UserRepo) UpdateUserStatus(ctx context.Context, id uuid.UUID, status string) error {
 	_, err := r.DB.ExecContext(ctx,
 		`UPDATE users SET status = $1, updated_at = $2 WHERE id = $3`,
