@@ -74,7 +74,7 @@
 
 <div class="voice-panel">
 	<div class="voice-info">
-		<span class="voice-label" class:speaking>Voice Connected</span>
+		<span class="voice-label">Voice Connected</span>
 		<span class="voice-channel">{channelName}</span>
 	</div>
 	<div class="voice-participants">
@@ -182,10 +182,6 @@
 		text-transform: uppercase;
 		letter-spacing: 0.02em;
 		transition: text-shadow 0.15s;
-	}
-
-	.voice-label.speaking {
-		text-shadow: 0 0 8px var(--accent);
 	}
 
 	.voice-channel {
