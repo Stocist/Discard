@@ -184,6 +184,20 @@ func (h *Hub) SendToClient(client *Client, data []byte) {
 	}
 }
 
+// SendToUser sends raw JSON data to all connections for a specific user.
+func (h *Hub) SendToUser(userID uuid.UUID, data []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for client := range h.allClients {
+		if client.UserID == userID {
+			select {
+			case client.send <- data:
+			default:
+			}
+		}
+	}
+}
+
 // removeClientLocked removes a client from all channels. Caller must hold h.mu write lock.
 func (h *Hub) removeClientLocked(client *Client) {
 	for chID, subs := range h.channels {

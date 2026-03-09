@@ -33,13 +33,18 @@ type Client struct {
 	conn     *websocket.Conn
 	send     chan []byte
 	closeSend sync.Once
-	UserID   uuid.UUID
+	UserID     uuid.UUID
+	Username   string
+	AvatarPath string
 
 	// OnMessage is called to persist incoming chat messages.
 	OnMessage MessageHandler
 
 	// CheckMembership is called before subscribing to a channel.
 	CheckMembership MembershipChecker
+
+	// OnVoice handles voice channel signaling.
+	OnVoice VoiceHandler
 }
 
 // CloseSend safely closes the send channel exactly once.
@@ -60,11 +65,37 @@ func NewClient(conn *websocket.Conn, userID uuid.UUID, handler MessageHandler, c
 	}
 }
 
+// VoiceHandler handles voice signaling without importing the voice package.
+type VoiceHandler interface {
+	Join(channelID, userID uuid.UUID, username, avatarPath string) (json.RawMessage, error)
+	Leave(channelID, userID uuid.UUID)
+	HandleAnswer(channelID, userID uuid.UUID, sdp json.RawMessage) error
+	HandleICE(channelID, userID uuid.UUID, candidate json.RawMessage) error
+	SetMuted(channelID, userID uuid.UUID, muted bool)
+	SetDeafened(channelID, userID uuid.UUID, deafened bool)
+	DisconnectUser(userID uuid.UUID)
+	GetAllVoiceStates() map[uuid.UUID][]VoiceParticipantState
+}
+
+// VoiceParticipantState is the WS-package view of a voice participant.
+type VoiceParticipantState struct {
+	UserID     uuid.UUID `json:"user_id"`
+	Username   string    `json:"username"`
+	AvatarPath string    `json:"avatar_path,omitempty"`
+	Muted      bool      `json:"muted"`
+	Deafened   bool      `json:"deafened"`
+}
+
 // incomingMessage is the envelope for messages from the browser.
 type incomingMessage struct {
-	Type      string `json:"type"`
-	ChannelID string `json:"channel_id,omitempty"`
-	Content   string `json:"content,omitempty"`
+	Type      string          `json:"type"`
+	ChannelID string          `json:"channel_id,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	SDP       json.RawMessage `json:"sdp,omitempty"`
+	Candidate json.RawMessage `json:"candidate,omitempty"`
+	Muted     *bool           `json:"muted,omitempty"`
+	Deafened  *bool           `json:"deafened,omitempty"`
+	Speaking  *bool           `json:"speaking,omitempty"`
 }
 
 // outgoingMessage is the envelope for messages sent to the browser.
@@ -77,6 +108,9 @@ type outgoingMessage struct {
 // Must be called in its own goroutine — one per connection.
 func (c *Client) ReadPump() {
 	defer func() {
+		if c.OnVoice != nil {
+			c.OnVoice.DisconnectUser(c.UserID)
+		}
 		c.hub.UnsubscribeAll(c)
 		c.conn.Close()
 	}()
@@ -136,6 +170,23 @@ func (c *Client) ReadPump() {
 
 		case "presence_request":
 			c.handlePresenceRequest()
+
+		case "voice_join":
+			c.handleVoiceJoin(msg)
+		case "voice_leave":
+			c.handleVoiceLeave(msg)
+		case "voice_answer":
+			c.handleVoiceAnswer(msg)
+		case "voice_ice_candidate":
+			c.handleVoiceICE(msg)
+		case "voice_mute":
+			c.handleVoiceMute(msg)
+		case "voice_deafen":
+			c.handleVoiceDeafen(msg)
+		case "voice_speaking":
+			c.handleVoiceSpeaking(msg)
+		case "voice_state_request":
+			c.handleVoiceStateRequest()
 
 		default:
 			log.Printf("ws unknown message type: %s", msg.Type)
@@ -199,6 +250,130 @@ func (c *Client) handlePresenceRequest() {
 	})
 	if err != nil {
 		log.Printf("presence list marshal error: %v", err)
+		return
+	}
+	c.hub.SendToClient(c, data)
+}
+
+func (c *Client) handleVoiceJoin(msg incomingMessage) {
+	if c.OnVoice == nil {
+		return
+	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		c.sendError("invalid channel_id")
+		return
+	}
+	sdp, err := c.OnVoice.Join(channelID, c.UserID, c.Username, c.AvatarPath)
+	if err != nil {
+		log.Printf("voice join error: %v", err)
+		c.sendError("failed to join voice channel")
+		return
+	}
+	data, _ := json.Marshal(map[string]interface{}{
+		"type":       "voice_offer",
+		"channel_id": channelID.String(),
+		"sdp":        json.RawMessage(sdp),
+	})
+	c.hub.SendToClient(c, data)
+}
+
+func (c *Client) handleVoiceLeave(msg incomingMessage) {
+	if c.OnVoice == nil {
+		return
+	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		return
+	}
+	c.OnVoice.Leave(channelID, c.UserID)
+}
+
+func (c *Client) handleVoiceAnswer(msg incomingMessage) {
+	if c.OnVoice == nil {
+		return
+	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		c.sendError("invalid channel_id")
+		return
+	}
+	if err := c.OnVoice.HandleAnswer(channelID, c.UserID, msg.SDP); err != nil {
+		log.Printf("voice answer error: %v", err)
+	}
+}
+
+func (c *Client) handleVoiceICE(msg incomingMessage) {
+	if c.OnVoice == nil {
+		return
+	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		c.sendError("invalid channel_id")
+		return
+	}
+	if err := c.OnVoice.HandleICE(channelID, c.UserID, msg.Candidate); err != nil {
+		log.Printf("voice ICE error: %v", err)
+	}
+}
+
+func (c *Client) handleVoiceMute(msg incomingMessage) {
+	if c.OnVoice == nil || msg.Muted == nil {
+		return
+	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		return
+	}
+	c.OnVoice.SetMuted(channelID, c.UserID, *msg.Muted)
+}
+
+func (c *Client) handleVoiceDeafen(msg incomingMessage) {
+	if c.OnVoice == nil || msg.Deafened == nil {
+		return
+	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		return
+	}
+	c.OnVoice.SetDeafened(channelID, c.UserID, *msg.Deafened)
+}
+
+func (c *Client) handleVoiceSpeaking(msg incomingMessage) {
+	if msg.Speaking == nil {
+		return
+	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		return
+	}
+	data, _ := json.Marshal(map[string]interface{}{
+		"type":       "voice_speaking",
+		"channel_id": channelID.String(),
+		"user_id":    c.UserID.String(),
+		"speaking":   *msg.Speaking,
+	})
+	c.hub.BroadcastAll(data)
+}
+
+func (c *Client) handleVoiceStateRequest() {
+	if c.OnVoice == nil {
+		return
+	}
+	states := c.OnVoice.GetAllVoiceStates()
+
+	// Convert uuid keys to strings for JSON
+	out := make(map[string]interface{}, len(states))
+	for channelID, participants := range states {
+		out[channelID.String()] = participants
+	}
+
+	data, err := json.Marshal(map[string]interface{}{
+		"type":     "voice_state_all",
+		"channels": out,
+	})
+	if err != nil {
+		log.Printf("voice state marshal error: %v", err)
 		return
 	}
 	c.hub.SendToClient(c, data)

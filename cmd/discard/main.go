@@ -6,9 +6,12 @@ import (
 	"os"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/Stocist/discard/internal/database"
 	"github.com/Stocist/discard/internal/frontend"
 	"github.com/Stocist/discard/internal/server"
+	"github.com/Stocist/discard/internal/voice"
 	"github.com/Stocist/discard/internal/websocket"
 )
 
@@ -41,7 +44,13 @@ func main() {
 	hub := websocket.NewHub()
 	go hub.Run()
 
-	srv := server.NewServer(db, hub)
+	sendToUser := func(userID uuid.UUID, data []byte) {
+		hub.SendToUser(userID, data)
+	}
+	voiceMgr := voice.NewManager(hub.BroadcastAll, sendToUser)
+	voiceAdapter := voice.NewAdapter(voiceMgr)
+
+	srv := server.NewServer(db, hub, voiceAdapter)
 	srv.SetupRoutes()
 
 	// Serve embedded frontend with SPA fallback

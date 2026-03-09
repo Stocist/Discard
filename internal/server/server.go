@@ -28,9 +28,10 @@ type Server struct {
 	hub       *ws.Hub
 	router    *http.ServeMux
 	uploadDir string
+	voiceMgr  ws.VoiceHandler
 }
 
-func NewServer(db *sql.DB, hub *ws.Hub) *Server {
+func NewServer(db *sql.DB, hub *ws.Hub, voiceMgr ws.VoiceHandler) *Server {
 	uploadDir := os.Getenv("UPLOAD_DIR")
 	if uploadDir == "" {
 		uploadDir = "./uploads"
@@ -40,6 +41,7 @@ func NewServer(db *sql.DB, hub *ws.Hub) *Server {
 		hub:       hub,
 		router:    http.NewServeMux(),
 		uploadDir: uploadDir,
+		voiceMgr:  voiceMgr,
 	}
 }
 
@@ -149,6 +151,15 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := ws.NewClient(conn, user.ID, handler, checker)
+	if user.DisplayName != nil {
+		client.Username = *user.DisplayName
+	} else {
+		client.Username = user.Username
+	}
+	if user.AvatarPath != nil {
+		client.AvatarPath = *user.AvatarPath
+	}
+	client.OnVoice = s.voiceMgr
 	s.hub.Register(client)
 	go client.WritePump()
 	go client.ReadPump()
