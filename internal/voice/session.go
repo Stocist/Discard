@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/stats"
 	"github.com/pion/webrtc/v4"
@@ -78,7 +79,15 @@ func newPeerConnection(me *webrtc.MediaEngine) (*webrtc.PeerConnection, error) {
 		return nil, err
 	}
 
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithInterceptorRegistry(i))
+	se := webrtc.SettingEngine{}
+	se.SetLite(true)
+	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(me),
+		webrtc.WithInterceptorRegistry(i),
+		webrtc.WithSettingEngine(se),
+	)
 	return api.NewPeerConnection(webrtc.Configuration{})
 }
 

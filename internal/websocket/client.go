@@ -108,7 +108,7 @@ type outgoingMessage struct {
 // Must be called in its own goroutine — one per connection.
 func (c *Client) ReadPump() {
 	defer func() {
-		if c.OnVoice != nil {
+		if c.OnVoice != nil && !c.hub.HasOtherConnections(c.UserID, c) {
 			c.OnVoice.DisconnectUser(c.UserID)
 		}
 		c.hub.UnsubscribeAll(c)

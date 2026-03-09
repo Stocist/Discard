@@ -184,6 +184,18 @@ func (h *Hub) SendToClient(client *Client, data []byte) {
 	}
 }
 
+// HasOtherConnections returns true if any client besides `exclude` belongs to the given user.
+func (h *Hub) HasOtherConnections(userID uuid.UUID, exclude *Client) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for client := range h.allClients {
+		if client != exclude && client.UserID == userID {
+			return true
+		}
+	}
+	return false
+}
+
 // SendToUser sends raw JSON data to all connections for a specific user.
 func (h *Hub) SendToUser(userID uuid.UUID, data []byte) {
 	h.mu.RLock()
