@@ -3,11 +3,12 @@
 	import { goto } from '$app/navigation';
 	import { getServer, listChannels, listMembers, fetchMe, getUnreadCounts, markChannelRead } from '$lib/api';
 	import { subscribeUnread, createWSConnection } from '$lib/ws';
-	import { leaveVoice, getVoiceChannelId } from '$lib/voice';
+	import { leaveVoice, getVoiceChannelId, getScreenShareChannelId, subscribeScreenShare, getRemoteScreenStream } from '$lib/voice';
 	import type { Channel, Server, ServerMember, User } from '$lib/types';
 	import ChannelSidebar from '$lib/components/ChannelSidebar.svelte';
 	import ChatView from '$lib/components/ChatView.svelte';
 	import MemberSidebar from '$lib/components/MemberSidebar.svelte';
+	import ScreenShareViewer from '$lib/components/ScreenShareViewer.svelte';
 
 	const serverId = $derived(page.params.serverId ?? '');
 	const channelId = $derived(page.params.channelId ?? '');
@@ -98,6 +99,15 @@
 	function toggleMembers() {
 		showMembers = !showMembers;
 	}
+
+	// Screen share state for showing viewer
+	let screenShareState = $state(0);
+	$effect(() => {
+		return subscribeScreenShare(() => { screenShareState++; });
+	});
+	const screenShareChannelId = $derived.by(() => { screenShareState; return getScreenShareChannelId(); });
+	const hasRemoteScreen = $derived.by(() => { screenShareState; return getRemoteScreenStream() !== null; });
+	const showScreenViewer = $derived(screenShareChannelId !== null && hasRemoteScreen);
 </script>
 
 <ChannelSidebar
@@ -112,8 +122,23 @@
 	ws={sharedWs}
 />
 
-{#if channelId}
-	<ChatView {channelId} {channelName} onToggleMembers={toggleMembers} ws={sharedWs} />
-{/if}
+<div class="chat-area">
+	{#if showScreenViewer && screenShareChannelId}
+		<ScreenShareViewer channelId={screenShareChannelId} />
+	{/if}
+	{#if channelId}
+		<ChatView {channelId} {channelName} onToggleMembers={toggleMembers} ws={sharedWs} />
+	{/if}
+</div>
 
 <MemberSidebar {members} visible={showMembers} />
+
+<style>
+	.chat-area {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		min-width: 0;
+		overflow: hidden;
+	}
+</style>

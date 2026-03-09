@@ -25,6 +25,28 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
 	return res.json();
 }
 
+// Tailscale status (public, no auth required)
+export interface TailscaleStatus {
+	on_tailscale: boolean;
+	authenticated: boolean;
+	dev_mode?: boolean;
+	error?: string;
+	user?: {
+		id: string;
+		username: string;
+		display_name: string | null;
+		avatar_path: string | null;
+	};
+}
+
+export async function fetchTailscaleStatus(): Promise<TailscaleStatus> {
+	const res = await fetch('/api/tailscale/status');
+	if (!res.ok) {
+		throw new Error(`Tailscale status check failed: ${res.status}`);
+	}
+	return res.json();
+}
+
 // Auth / user
 export function fetchMe(): Promise<User> {
 	return apiFetch('/me');

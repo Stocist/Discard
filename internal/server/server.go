@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/google/uuid"
 	gorillaWs "github.com/gorilla/websocket"
@@ -55,8 +56,9 @@ func (s *Server) SetupRoutes() {
 		s.router.Handle(pattern, authed(h))
 	}
 
-	// Public
+	// Public (no auth required)
 	s.router.HandleFunc("GET /api/health", s.handleHealth)
+	s.router.HandleFunc("GET /api/tailscale/status", s.handleTailscaleStatus)
 
 	// Me
 	a("GET /api/me", s.handleMe)
@@ -108,6 +110,46 @@ func (s *Server) SetupRoutes() {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleTailscaleStatus is a public (no-auth) endpoint that checks whether the
+// requester is on the Tailscale network and, if so, returns their user info.
+func (s *Server) handleTailscaleStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	devMode := strings.EqualFold(os.Getenv("DISCARD_DEV"), "true")
+	if devMode {
+		json.NewEncoder(w).Encode(map[string]any{
+			"on_tailscale":  true,
+			"authenticated": true,
+			"dev_mode":      true,
+		})
+		return
+	}
+
+	// Try to authenticate via auth middleware's exported function.
+	userRepo := &database.UserRepo{DB: s.db}
+	user, err := auth.TailscaleStatus(r, userRepo)
+	if err != nil {
+		// Not on Tailscale or whois failed
+		json.NewEncoder(w).Encode(map[string]any{
+			"on_tailscale":  false,
+			"authenticated": false,
+			"error":         "Not connected to Tailscale network",
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]any{
+		"on_tailscale":  true,
+		"authenticated": true,
+		"user": map[string]any{
+			"id":           user.ID,
+			"username":     user.Username,
+			"display_name": user.DisplayName,
+			"avatar_path":  user.AvatarPath,
+		},
+	})
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {

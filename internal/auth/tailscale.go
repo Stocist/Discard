@@ -148,6 +148,20 @@ func devUser(ctx context.Context, repo UserRepo, r *http.Request) (*models.User,
 	return u, nil
 }
 
+// TailscaleStatus checks if the request comes from a Tailscale user and returns
+// their user model (or auto-creates them). Used by the public status endpoint.
+func TailscaleStatus(r *http.Request, repo UserRepo) (*models.User, error) {
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	tsAPIURL := os.Getenv("TAILSCALE_API_URL")
+	if tsAPIURL == "" {
+		tsAPIURL = "http://127.0.0.1:41112"
+	}
+	tsAPIToken := os.Getenv("TAILSCALE_API_TOKEN")
+
+	return tailscaleAuth(r.Context(), repo, client, r.RemoteAddr, tsAPIURL, tsAPIToken)
+}
+
 // tailscaleAuth authenticates via the Tailscale local API.
 func tailscaleAuth(ctx context.Context, repo UserRepo, client *http.Client, remoteAddr, apiURL, apiToken string) (*models.User, error) {
 	host, _, err := net.SplitHostPort(remoteAddr)
