@@ -133,7 +133,16 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 			s.mu.Unlock()
 			return nil, err
 		}
-		if _, err := pc.AddTrack(track); err != nil {
+		// Use sendonly transceiver so client sees recvonly direction in offer
+		transceiver, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionSendonly,
+		})
+		if err != nil {
+			pc.Close()
+			s.mu.Unlock()
+			return nil, err
+		}
+		if err := transceiver.Sender().ReplaceTrack(track); err != nil {
 			pc.Close()
 			s.mu.Unlock()
 			return nil, err
@@ -151,7 +160,16 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 			s.mu.Unlock()
 			return nil, err
 		}
-		if _, err := other.PC.AddTrack(otherTrack); err != nil {
+		// Use sendonly transceiver so client sees recvonly direction in offer
+		otherTransceiver, err := other.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionSendonly,
+		})
+		if err != nil {
+			pc.Close()
+			s.mu.Unlock()
+			return nil, err
+		}
+		if err := otherTransceiver.Sender().ReplaceTrack(otherTrack); err != nil {
 			pc.Close()
 			s.mu.Unlock()
 			return nil, err
