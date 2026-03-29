@@ -409,6 +409,19 @@ func (r *UserRepo) GetByUsername(ctx context.Context, username string) (*models.
 	return u, nil
 }
 
+func (r *ServerRepo) UpdateInviteCode(ctx context.Context, id uuid.UUID, code string) (*models.Server, error) {
+	s := &models.Server{}
+	err := r.DB.QueryRowContext(ctx,
+		`UPDATE servers SET invite_code = $1 WHERE id = $2
+		 RETURNING id, name, icon_path, owner_id, invite_code, created_at`,
+		code, id,
+	).Scan(&s.ID, &s.Name, &s.IconPath, &s.OwnerID, &s.InviteCode, &s.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
 // ServerRepo helper: look up a server by invite code.
 func (r *ServerRepo) GetServerByInviteCode(ctx context.Context, code string) (*models.Server, error) {
 	s := &models.Server{}

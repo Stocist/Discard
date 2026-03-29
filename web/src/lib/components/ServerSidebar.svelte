@@ -3,7 +3,7 @@
 	import type { Server } from '$lib/types';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { listServers, createServer, fetchMe, deleteServer } from '$lib/api';
+	import { listServers, createServer, fetchMe, deleteServer, joinServer } from '$lib/api';
 	import { subscribeServerEvents } from '$lib/ws';
 	import ContextMenu from './ContextMenu.svelte';
 
@@ -12,6 +12,10 @@
 	let newServerName = $state('');
 	let loading = $state(false);
 	let currentUserId = $state('');
+	let showJoinModal = $state(false);
+	let joinCode = $state('');
+	let joining = $state(false);
+	let joinError = $state('');
 
 	const currentServerId = $derived(page.params?.serverId ?? '');
 
@@ -36,6 +40,31 @@
 			console.error('Failed to create server:', e);
 		} finally {
 			loading = false;
+		}
+	}
+
+	async function handleJoin() {
+		const code = joinCode.trim();
+		if (!code || joining) return;
+		joining = true;
+		joinError = '';
+		try {
+			const server = await joinServer(code);
+			servers = [...servers, server];
+			showJoinModal = false;
+			joinCode = '';
+			goto(`/servers/${server.id}`);
+		} catch (e: any) {
+			const msg = e?.message ?? '';
+			if (msg.includes('already a member')) {
+				joinError = 'You are already a member of this server.';
+			} else if (msg.includes('invalid invite code') || e?.status === 404) {
+				joinError = 'Invalid invite code.';
+			} else {
+				joinError = 'Failed to join server.';
+			}
+		} finally {
+			joining = false;
 		}
 	}
 
@@ -101,6 +130,7 @@
 		if (e.key === 'Escape') {
 			if (confirmDeleteServerId) { confirmDeleteServerId = null; return; }
 			if (showCreateModal) { showCreateModal = false; newServerName = ''; return; }
+			if (showJoinModal) { showJoinModal = false; joinCode = ''; joinError = ''; return; }
 		}
 	}
 </script>
@@ -131,6 +161,10 @@
 
 	<button class="server-icon add-btn" title="Create Server" onclick={() => (showCreateModal = true)}>
 		+
+	</button>
+
+	<button class="server-icon join-btn" title="Join Server" onclick={() => (showJoinModal = true)}>
+		&#x2192;
 	</button>
 </nav>
 
@@ -164,6 +198,34 @@
 		items={serverContextItems(serverCtx.serverId)}
 		onClose={() => (serverCtx = null)}
 	/>
+{/if}
+
+{#if showJoinModal}
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="modal-overlay" onclick={() => { showJoinModal = false; joinCode = ''; joinError = ''; }}>
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="modal" onclick={(e) => e.stopPropagation()}>
+			<h2>Join a Server</h2>
+			<p class="join-hint">Enter an invite code to join an existing server.</p>
+			{#if joinError}
+				<p class="join-error">{joinError}</p>
+			{/if}
+			<form onsubmit={(e) => { e.preventDefault(); handleJoin(); }}>
+				<input
+					type="text"
+					placeholder="Enter invite code"
+					bind:value={joinCode}
+					class="join-input"
+				/>
+				<div class="modal-actions">
+					<button type="button" class="cancel-btn" onclick={() => { showJoinModal = false; joinCode = ''; joinError = ''; }}>Cancel</button>
+					<button type="submit" class="create-btn" disabled={!joinCode.trim() || joining}>
+						{joining ? 'Joining...' : 'Join Server'}
+					</button>
+				</div>
+			</form>
+		</div>
+	</div>
 {/if}
 
 {#if confirmDeleteServerId}
@@ -241,6 +303,17 @@
 	}
 
 	.add-btn:hover {
+		background: var(--accent);
+		color: white;
+		border-radius: 16px;
+	}
+
+	.join-btn {
+		font-size: 20px;
+		color: var(--accent);
+	}
+
+	.join-btn:hover {
 		background: var(--accent);
 		color: white;
 		border-radius: 16px;
@@ -339,5 +412,23 @@
 	.delete-btn:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+
+	.join-hint {
+		color: var(--text-muted);
+		font-size: 14px;
+		line-height: 1.5;
+		margin-bottom: 12px;
+	}
+
+	.join-error {
+		color: #ef4444;
+		font-size: 13px;
+		margin-bottom: 8px;
+	}
+
+	.join-input {
+		font-family: monospace;
+		letter-spacing: 0.05em;
 	}
 </style>

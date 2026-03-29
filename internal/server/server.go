@@ -72,6 +72,8 @@ func (s *Server) SetupRoutes() {
 	a("PUT /api/servers/{id}", s.handleUpdateServer)
 	a("DELETE /api/servers/{id}", s.handleDeleteServer)
 
+	a("POST /api/servers/{id}/invite-code/regenerate", s.handleRegenerateInviteCode)
+
 	// Channels
 	a("POST /api/servers/{id}/channels", s.handleCreateChannel)
 	a("GET /api/servers/{id}/channels", s.handleListChannels)

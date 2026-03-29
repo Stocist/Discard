@@ -115,6 +115,10 @@ export function deleteServer(serverId: string): Promise<void> {
 	return apiFetch(`/servers/${serverId}`, { method: 'DELETE' });
 }
 
+export function regenerateInviteCode(serverId: string): Promise<Server> {
+	return apiFetch(`/servers/${serverId}/invite-code/regenerate`, { method: 'POST' });
+}
+
 export function leaveServer(serverId: string): Promise<void> {
 	return apiFetch(`/servers/${serverId}/members/me`, { method: 'DELETE' });
 }

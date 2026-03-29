@@ -702,6 +702,49 @@ func (s *Server) handleJoinServer(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(srv)
 }
 
+func (s *Server) handleRegenerateInviteCode(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	serverID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		jsonError(w, "invalid server id", http.StatusBadRequest)
+		return
+	}
+
+	// Only the owner can regenerate the invite code.
+	serverRepo := &database.ServerRepo{DB: s.db}
+	srv, err := serverRepo.GetServerByID(r.Context(), serverID)
+	if err == sql.ErrNoRows {
+		jsonError(w, "server not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, "failed to get server", http.StatusInternalServerError)
+		return
+	}
+	if srv.OwnerID != user.ID {
+		jsonError(w, "only the server owner can regenerate the invite code", http.StatusForbidden)
+		return
+	}
+
+	codeBytes := make([]byte, 8)
+	rand.Read(codeBytes)
+	newCode := hex.EncodeToString(codeBytes)
+
+	updated, err := serverRepo.UpdateInviteCode(r.Context(), serverID, newCode)
+	if err != nil {
+		jsonError(w, "failed to regenerate invite code", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updated)
+}
+
 func (s *Server) handleLeaveServer(w http.ResponseWriter, r *http.Request) {
 	user := auth.UserFromContext(r.Context())
 	if user == nil {

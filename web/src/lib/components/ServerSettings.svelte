@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Server } from '$lib/types';
-	import { updateServer, deleteServer } from '$lib/api';
+	import { updateServer, deleteServer, regenerateInviteCode } from '$lib/api';
 	import ImageCropper from './ImageCropper.svelte';
 
 	let { server, onclose, ondelete, onsave }: {
@@ -20,6 +20,10 @@
 	let fileInput: HTMLInputElement;
 	let showCropper = $state(false);
 	let cropperSrc = $state('');
+	let inviteCode = $state(server.invite_code ?? '');
+	let copied = $state(false);
+	let regenerating = $state(false);
+	let confirmRegenerate = $state(false);
 
 	function handleIconSelect(e: Event) {
 		const input = e.target as HTMLInputElement;
@@ -80,6 +84,31 @@
 		}
 	}
 
+	async function handleCopyInvite() {
+		try {
+			await navigator.clipboard.writeText(inviteCode);
+			copied = true;
+			setTimeout(() => { copied = false; }, 2000);
+		} catch {
+			error = 'Failed to copy to clipboard.';
+		}
+	}
+
+	async function handleRegenerate() {
+		if (regenerating) return;
+		regenerating = true;
+		error = '';
+		try {
+			const updated = await regenerateInviteCode(server.id);
+			inviteCode = updated.invite_code ?? '';
+			confirmRegenerate = false;
+		} catch {
+			error = 'Failed to regenerate invite code.';
+		} finally {
+			regenerating = false;
+		}
+	}
+
 	function handleKeydown(e: KeyboardEvent) {
 		if (e.key === 'Escape') onclose();
 	}
@@ -131,6 +160,30 @@
 				</button>
 			</div>
 		</form>
+
+		<div class="invite-section">
+			<label class="field-label">Invite Code</label>
+			<p class="invite-hint">Share this code with others so they can join your server.</p>
+			<div class="invite-code-row">
+				<code class="invite-code">{inviteCode}</code>
+				<button type="button" class="copy-btn" onclick={handleCopyInvite}>
+					{copied ? 'Copied!' : 'Copy'}
+				</button>
+			</div>
+			{#if !confirmRegenerate}
+				<button type="button" class="regenerate-btn" onclick={() => (confirmRegenerate = true)}>
+					Regenerate
+				</button>
+			{:else}
+				<p class="regenerate-warning">Anyone with the old code will no longer be able to join.</p>
+				<div class="regenerate-actions">
+					<button type="button" class="cancel-btn" onclick={() => (confirmRegenerate = false)}>Cancel</button>
+					<button type="button" class="regenerate-confirm-btn" onclick={handleRegenerate} disabled={regenerating}>
+						{regenerating ? 'Regenerating...' : 'Yes, Regenerate'}
+					</button>
+				</div>
+			{/if}
+		</div>
 
 		<div class="danger-zone">
 			<h3>Danger Zone</h3>
@@ -285,6 +338,94 @@
 	}
 
 	.save-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.invite-section {
+		margin-top: 24px;
+		padding-top: 16px;
+		border-top: 1px solid var(--border);
+	}
+
+	.invite-hint {
+		font-size: 13px;
+		color: var(--text-muted);
+		margin-bottom: 8px;
+	}
+
+	.invite-code-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-bottom: 8px;
+	}
+
+	.invite-code {
+		flex: 1;
+		padding: 8px 12px;
+		background: var(--bg-input);
+		border-radius: 4px;
+		color: var(--text-primary);
+		font-family: monospace;
+		font-size: 14px;
+		letter-spacing: 0.05em;
+		user-select: all;
+	}
+
+	.copy-btn {
+		padding: 8px 14px;
+		background: var(--accent);
+		color: white;
+		border-radius: 4px;
+		font-weight: 500;
+		font-size: 13px;
+		white-space: nowrap;
+	}
+
+	.copy-btn:hover {
+		background: var(--accent-hover);
+	}
+
+	.regenerate-btn {
+		padding: 6px 12px;
+		background: transparent;
+		border: 1px solid var(--border);
+		color: var(--text-muted);
+		border-radius: 4px;
+		font-size: 13px;
+	}
+
+	.regenerate-btn:hover {
+		color: var(--text-primary);
+		border-color: var(--text-muted);
+	}
+
+	.regenerate-warning {
+		font-size: 13px;
+		color: var(--text-muted);
+		margin-bottom: 8px;
+		line-height: 1.5;
+	}
+
+	.regenerate-actions {
+		display: flex;
+		gap: 8px;
+	}
+
+	.regenerate-confirm-btn {
+		padding: 8px 16px;
+		background: var(--accent);
+		color: white;
+		border-radius: 4px;
+		font-weight: 500;
+	}
+
+	.regenerate-confirm-btn:hover:not(:disabled) {
+		background: var(--accent-hover);
+	}
+
+	.regenerate-confirm-btn:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
 	}
