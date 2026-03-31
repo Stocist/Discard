@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Message } from '$lib/types';
-	import { listMessages, editMessage, deleteMessage } from '$lib/api';
+	import { listMessages, editMessage, deleteMessage, avatarSrc } from '$lib/api';
 	import { fetchMe } from '$lib/api';
 	import { subscribe, unsubscribe, sendMessage } from '$lib/ws';
 	import { renderMarkdown } from '$lib/markdown';
@@ -37,6 +37,7 @@
 
 	// Current user ID for ownership checks
 	let currentUserId = $state<string | null>(null);
+	let failedAvatars = $state(new Set<string>());
 
 	// Context menu state
 	let contextMenu = $state<{ x: number; y: number; message: Message } | null>(null);
@@ -278,8 +279,8 @@
 			>
 				{#if !grouped}
 					<div class="message-header">
-						{#if message.author_avatar_url}
-							<img class="avatar" src="/uploads/{message.author_avatar_url}" alt="" />
+						{#if message.author_avatar_url && !failedAvatars.has(message.author_avatar_url)}
+							<img class="avatar" src={avatarSrc(message.author_avatar_url!)} alt="" onerror={() => { failedAvatars.add(message.author_avatar_url!); failedAvatars = failedAvatars; }} />
 						{:else}
 							<span class="avatar" style="background: {avatarColor(message.author_username ?? message.author_id)}">{(message.author_username ?? message.author_id).charAt(0).toUpperCase()}</span>
 						{/if}
@@ -341,6 +342,7 @@
 		display: flex;
 		flex-direction: column;
 		min-width: 0;
+		min-height: 0;
 		background: var(--bg-primary);
 	}
 

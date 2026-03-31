@@ -1,13 +1,32 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, setContext } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import ServerSidebar from '$lib/components/ServerSidebar.svelte';
+	import InstallPrompt from '$lib/components/InstallPrompt.svelte';
 	import { fetchMe } from '$lib/api';
 
 	let { children } = $props();
 
 	let sidebarOpen = $state(false);
 	let authenticated = $state(false);
+
+	// Share sidebar state with child pages via context
+	const sidebarState = {
+		get open() { return sidebarOpen; },
+		close() { sidebarOpen = false; }
+	};
+	setContext('mobileSidebar', sidebarState);
+
+	// Close sidebar on navigation (e.g. when user taps a channel on mobile)
+	let lastPath = $state('');
+	$effect(() => {
+		const currentPath = page.url.pathname;
+		if (lastPath && currentPath !== lastPath) {
+			sidebarOpen = false;
+		}
+		lastPath = currentPath;
+	});
 
 	onMount(async () => {
 		try {
@@ -21,12 +40,19 @@
 
 {#if authenticated}
 	<div class="app-shell">
-		<button class="hamburger" onclick={() => (sidebarOpen = !sidebarOpen)} aria-label="Toggle sidebar">
-			<span class="hamburger-icon">{sidebarOpen ? '\u2715' : '\u2630'}</span>
-		</button>
+		{#if !sidebarOpen}
+			<button class="hamburger" onclick={() => (sidebarOpen = true)} aria-label="Open sidebar">
+				<span class="hamburger-icon">&#x2630;</span>
+			</button>
+		{/if}
 
 		<div class="sidebar-wrapper" class:open={sidebarOpen}>
 			<ServerSidebar />
+			{#if sidebarOpen}
+				<button class="sidebar-close" onclick={() => (sidebarOpen = false)} aria-label="Close sidebar">
+					<span class="hamburger-icon">&#x2715;</span>
+				</button>
+			{/if}
 		</div>
 
 		{#if sidebarOpen}
@@ -37,6 +63,8 @@
 		<div class="main-content">
 			{@render children()}
 		</div>
+
+		<InstallPrompt />
 	</div>
 {:else}
 	<div class="loading">
@@ -89,6 +117,10 @@
 		line-height: 1;
 	}
 
+	.sidebar-close {
+		display: none;
+	}
+
 	.sidebar-wrapper {
 		display: contents;
 	}
@@ -115,6 +147,21 @@
 
 		.sidebar-wrapper.open {
 			transform: translateX(0);
+		}
+
+		.sidebar-close {
+			display: flex;
+			position: absolute;
+			top: 8px;
+			right: -44px;
+			z-index: 55;
+			width: 36px;
+			height: 36px;
+			border-radius: 6px;
+			background: var(--bg-secondary);
+			align-items: center;
+			justify-content: center;
+			border: 1px solid var(--border);
 		}
 
 		.sidebar-backdrop {

@@ -1,6 +1,7 @@
 <script lang="ts">
+	import { getContext } from 'svelte';
 	import type { Channel, Server, User } from '$lib/types';
-	import { createChannel, updateChannel, deleteChannel } from '$lib/api';
+	import { createChannel, updateChannel, deleteChannel, avatarSrc } from '$lib/api';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import ServerSettings from './ServerSettings.svelte';
@@ -8,6 +9,8 @@
 	import UserProfile from './UserProfile.svelte';
 	import VoicePanel from './VoicePanel.svelte';
 	import { joinVoice, getVoiceChannelId, getParticipants, subscribeVoice, getVoiceError, subscribeVoiceError } from '$lib/voice';
+
+	const mobileSidebar = getContext<{ open: boolean; close: () => void } | undefined>('mobileSidebar');
 
 	let { serverId, channels = $bindable(), serverName = $bindable(), server = $bindable(), isOwner = false, onserverdelete, unreadCounts = {}, currentUser = $bindable(), ws }: {
 		serverId: string;
@@ -23,6 +26,7 @@
 
 	let showSettings = $state(false);
 	let showProfile = $state(false);
+	let failedAvatars = $state(new Set<string>());
 
 	const currentChannelId = $derived(page.params?.channelId ?? '');
 
@@ -211,7 +215,7 @@
 
 <svelte:window onkeydown={handleGlobalKeydown} />
 
-<aside class="channel-sidebar">
+<aside class="channel-sidebar" class:open={mobileSidebar?.open}>
 	<div class="server-header">
 		<h2>{serverName}</h2>
 		{#if isOwner}
@@ -320,8 +324,8 @@
 				<div class="voice-participants-inline">
 					{#each vcParticipants as p (p.user_id)}
 						<div class="voice-participant-inline" class:speaking={p.speaking}>
-							{#if p.avatar_path}
-								<img class="voice-inline-avatar" src="/uploads/{p.avatar_path}" alt="" />
+							{#if p.avatar_path && !failedAvatars.has(p.avatar_path)}
+								<img class="voice-inline-avatar" src={avatarSrc(p.avatar_path!)} alt="" onerror={() => { failedAvatars.add(p.avatar_path!); failedAvatars = failedAvatars; }} />
 							{:else}
 								<span class="voice-inline-avatar voice-inline-avatar-fallback">{(p.username ?? '?').charAt(0).toUpperCase()}</span>
 							{/if}
@@ -337,14 +341,14 @@
 	</div>
 
 	{#if connectedVoiceChannel && ws}
-		<VoicePanel {ws} channelName={connectedVoiceChannel.name ?? 'Voice'} />
+		<VoicePanel {ws} channelName={connectedVoiceChannel.name ?? 'Voice'} userId={currentUser?.id ?? ''} />
 	{/if}
 
 	{#if currentUser}
 		<button class="user-panel" onclick={() => (showProfile = true)}>
 			<div class="user-panel-avatar-wrapper">
-				{#if currentUser.avatar_path}
-					<img class="user-panel-avatar" src="/uploads/{currentUser.avatar_path}" alt="" />
+				{#if currentUser.avatar_path && !failedAvatars.has(currentUser.avatar_path)}
+					<img class="user-panel-avatar" src={avatarSrc(currentUser.avatar_path!)} alt="" onerror={() => { failedAvatars.add(currentUser!.avatar_path!); failedAvatars = failedAvatars; }} />
 				{:else}
 					<span class="user-panel-avatar user-panel-avatar-fallback">{(currentUser.username ?? '?').charAt(0).toUpperCase()}</span>
 				{/if}
@@ -832,11 +836,15 @@
 		.channel-sidebar {
 			position: fixed;
 			top: 0;
-			left: 0;
+			left: 72px;
 			bottom: 0;
-			z-index: 45;
-			transform: translateX(-100%);
+			z-index: 50;
+			transform: translateX(calc(-100% - 72px));
 			transition: transform 0.2s ease;
+		}
+
+		.channel-sidebar.open {
+			transform: translateX(0);
 		}
 	}
 </style>
