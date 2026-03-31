@@ -2,7 +2,7 @@
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { getServer, listChannels, listMembers, fetchMe, getUnreadCounts, markChannelRead } from '$lib/api';
-	import { subscribeUnread, createWSConnection } from '$lib/ws';
+	import { subscribeUnread, subscribeMemberJoined, createWSConnection } from '$lib/ws';
 	import { leaveVoice, getVoiceChannelId, getScreenShareChannelId, subscribeScreenShare, getRemoteScreenStream } from '$lib/voice';
 	import type { Channel, Server, ServerMember, User } from '$lib/types';
 	import ChannelSidebar from '$lib/components/ChannelSidebar.svelte';
@@ -92,6 +92,25 @@
 		});
 	});
 
+	// Update member sidebar when a new user joins this server
+	$effect(() => {
+		const sid = serverId;
+		return subscribeMemberJoined((event) => {
+			if (event.server_id !== sid) return;
+			const alreadyExists = members.some(m => m.user_id === event.member.user_id);
+			if (alreadyExists) return;
+			members = [...members, {
+				user_id: event.member.user_id,
+				server_id: event.server_id,
+				nickname: null,
+				joined_at: new Date().toISOString(),
+				username: event.member.username,
+				display_name: event.member.display_name,
+				avatar_url: event.member.avatar_url,
+			}];
+		});
+	});
+
 	function handleServerDelete() {
 		goto('/');
 	}
@@ -131,7 +150,7 @@
 	{/if}
 </div>
 
-<MemberSidebar {members} visible={showMembers} />
+<MemberSidebar {members} visible={showMembers} {currentUserId} />
 
 <style>
 	.chat-area {

@@ -697,6 +697,22 @@ func (s *Server) handleJoinServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Broadcast member_joined to all clients so member sidebars refresh.
+	out, err := json.Marshal(map[string]any{
+		"type":      "member_joined",
+		"server_id": srv.ID.String(),
+		"member": map[string]any{
+			"user_id":      user.ID.String(),
+			"username":     user.Username,
+			"display_name": user.DisplayName,
+			"avatar_url":   user.AvatarPath,
+			"role":         "member",
+		},
+	})
+	if err == nil {
+		s.hub.BroadcastAll(out)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(srv)
@@ -783,9 +799,9 @@ func (s *Server) handleLeaveServer(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// --- Friends ---
+// --- DMs ---
 
-func (s *Server) handleSendFriendRequest(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleOpenDM(w http.ResponseWriter, r *http.Request) {
 	user := auth.UserFromContext(r.Context())
 	if user == nil {
 		jsonError(w, "unauthorized", http.StatusUnauthorized)
@@ -793,152 +809,235 @@ func (s *Server) handleSendFriendRequest(w http.ResponseWriter, r *http.Request)
 	}
 
 	var input struct {
-		Username string `json:"username"`
+		UserID string `json:"user_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-	if input.Username == "" {
-		jsonError(w, "username is required", http.StatusBadRequest)
-		return
-	}
-	if len(input.Username) > 32 {
-		jsonError(w, "username must be 32 characters or less", http.StatusBadRequest)
+
+	targetID, err := uuid.Parse(input.UserID)
+	if err != nil {
+		jsonError(w, "invalid user_id", http.StatusBadRequest)
 		return
 	}
 
-	// Cannot friend yourself.
-	if input.Username == user.Username {
-		jsonError(w, "cannot send friend request to yourself", http.StatusBadRequest)
+	if targetID == user.ID {
+		jsonError(w, "cannot open DM with yourself", http.StatusBadRequest)
 		return
 	}
 
 	userRepo := &database.UserRepo{DB: s.db}
-	target, err := userRepo.GetByUsername(r.Context(), input.Username)
-	if err == sql.ErrNoRows {
+	if _, err := userRepo.GetByID(r.Context(), targetID); err == sql.ErrNoRows {
 		jsonError(w, "user not found", http.StatusNotFound)
 		return
-	}
-	if err != nil {
+	} else if err != nil {
 		jsonError(w, "failed to look up user", http.StatusInternalServerError)
 		return
 	}
 
-	friendRepo := &database.FriendshipRepo{DB: s.db}
-	f := &models.Friendship{
-		UserA:       user.ID,
-		UserB:       target.ID,
-		InitiatedBy: user.ID,
-	}
-	if err := friendRepo.CreateFriendRequest(r.Context(), f); err != nil {
-		jsonError(w, "failed to send friend request", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(f)
-}
-
-func (s *Server) handleAcceptFriend(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil {
-		jsonError(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	friendshipID, err := uuid.Parse(r.PathValue("id"))
+	blockRepo := &database.BlockRepo{DB: s.db}
+	blocked, err := blockRepo.IsBlocked(r.Context(), user.ID, targetID)
 	if err != nil {
-		jsonError(w, "invalid friendship id", http.StatusBadRequest)
+		jsonError(w, "failed to check blocks", http.StatusInternalServerError)
+		return
+	}
+	if blocked {
+		jsonError(w, "cannot open DM with this user", http.StatusForbidden)
 		return
 	}
 
-	friendRepo := &database.FriendshipRepo{DB: s.db}
-	f, err := friendRepo.GetByID(r.Context(), friendshipID)
-	if err == sql.ErrNoRows {
-		jsonError(w, "friend request not found", http.StatusNotFound)
-		return
-	}
+	memberRepo := &database.ServerMemberRepo{DB: s.db}
+	shared, err := memberRepo.ShareServer(r.Context(), user.ID, targetID)
 	if err != nil {
-		jsonError(w, "failed to get friend request", http.StatusInternalServerError)
+		jsonError(w, "failed to check shared servers", http.StatusInternalServerError)
+		return
+	}
+	if !shared {
+		jsonError(w, "you must share a server to DM this user", http.StatusForbidden)
 		return
 	}
 
-	// Only the non-initiator can accept.
-	if f.InitiatedBy == user.ID {
-		jsonError(w, "cannot accept your own friend request", http.StatusForbidden)
+	dmRepo := &database.DMMemberRepo{DB: s.db}
+	existing, err := dmRepo.FindDMChannel(r.Context(), user.ID, targetID)
+	if err == nil {
+		// Channel exists — reopen if closed for this user.
+		if reopenErr := dmRepo.ReopenDM(r.Context(), existing.ID, user.ID); reopenErr != nil {
+			jsonError(w, "failed to reopen DM", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(existing)
+
+		// Notify the other user.
+		out, _ := json.Marshal(map[string]any{
+			"type":       "dm_opened",
+			"channel_id": existing.ID.String(),
+		})
+		s.hub.SendToUser(targetID, out)
 		return
 	}
-	// Verify the current user is part of this friendship.
-	if f.UserA != user.ID && f.UserB != user.ID {
-		jsonError(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	if f.Status != "pending" {
-		jsonError(w, "friend request is not pending", http.StatusConflict)
+	if err != sql.ErrNoRows {
+		jsonError(w, "failed to find DM channel", http.StatusInternalServerError)
 		return
 	}
 
-	// Accept the friendship.
-	if err := friendRepo.AcceptFriend(r.Context(), friendshipID); err != nil {
-		jsonError(w, "failed to accept friend request", http.StatusInternalServerError)
-		return
-	}
-
-	// Create a DM channel between the two users.
-	dmChannel := &models.Channel{
-		Type: "dm",
-	}
+	// Create new DM channel.
+	ch := &models.Channel{Type: "dm"}
 	channelRepo := &database.ChannelRepo{DB: s.db}
-	if err := channelRepo.CreateChannel(r.Context(), dmChannel); err != nil {
+	if err := channelRepo.CreateChannel(r.Context(), ch); err != nil {
 		jsonError(w, "failed to create DM channel", http.StatusInternalServerError)
 		return
 	}
 
-	// Add both users to the DM channel.
-	dmMemberRepo := &database.DMMemberRepo{DB: s.db}
-	if err := dmMemberRepo.AddMember(r.Context(), dmChannel.ID, f.UserA); err != nil {
+	if err := dmRepo.AddMember(r.Context(), ch.ID, user.ID); err != nil {
 		jsonError(w, "failed to add DM member", http.StatusInternalServerError)
 		return
 	}
-	if err := dmMemberRepo.AddMember(r.Context(), dmChannel.ID, f.UserB); err != nil {
+	if err := dmRepo.AddMember(r.Context(), ch.ID, targetID); err != nil {
 		jsonError(w, "failed to add DM member", http.StatusInternalServerError)
 		return
 	}
 
-	// Link the DM channel to the friendship.
-	if err := friendRepo.SetDMChannelID(r.Context(), friendshipID, dmChannel.ID); err != nil {
-		jsonError(w, "failed to link DM channel", http.StatusInternalServerError)
-		return
-	}
-
-	f.Status = "accepted"
-	f.DMChannelID = &dmChannel.ID
+	// Notify the other user.
+	out, _ := json.Marshal(map[string]any{
+		"type":       "dm_opened",
+		"channel_id": ch.ID.String(),
+	})
+	s.hub.SendToUser(targetID, out)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(f)
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(ch)
 }
 
-func (s *Server) handleListFriends(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListDMs(w http.ResponseWriter, r *http.Request) {
 	user := auth.UserFromContext(r.Context())
 	if user == nil {
 		jsonError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	friendRepo := &database.FriendshipRepo{DB: s.db}
-	friends, err := friendRepo.ListFriends(r.Context(), user.ID)
+	dmRepo := &database.DMMemberRepo{DB: s.db}
+	dms, err := dmRepo.ListUserDMs(r.Context(), user.ID)
 	if err != nil {
-		jsonError(w, "failed to list friends", http.StatusInternalServerError)
+		jsonError(w, "failed to list DMs", http.StatusInternalServerError)
 		return
 	}
-	if friends == nil {
-		friends = []models.Friendship{}
+	if dms == nil {
+		dms = []models.DMChannelView{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(friends)
+	json.NewEncoder(w).Encode(dms)
+}
+
+func (s *Server) handleCloseDM(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	channelID, err := uuid.Parse(r.PathValue("channelId"))
+	if err != nil {
+		jsonError(w, "invalid channel id", http.StatusBadRequest)
+		return
+	}
+
+	dmRepo := &database.DMMemberRepo{DB: s.db}
+	if err := dmRepo.CloseDM(r.Context(), channelID, user.ID); err != nil {
+		jsonError(w, "failed to close DM", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Blocks ---
+
+func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var input struct {
+		UserID string `json:"user_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	targetID, err := uuid.Parse(input.UserID)
+	if err != nil {
+		jsonError(w, "invalid user_id", http.StatusBadRequest)
+		return
+	}
+
+	if targetID == user.ID {
+		jsonError(w, "cannot block yourself", http.StatusBadRequest)
+		return
+	}
+
+	blockRepo := &database.BlockRepo{DB: s.db}
+	if err := blockRepo.Block(r.Context(), user.ID, targetID); err != nil {
+		jsonError(w, "failed to block user", http.StatusInternalServerError)
+		return
+	}
+
+	// Close any open DM between the two users.
+	dmRepo := &database.DMMemberRepo{DB: s.db}
+	if ch, err := dmRepo.FindDMChannel(r.Context(), user.ID, targetID); err == nil {
+		_ = dmRepo.CloseDM(r.Context(), ch.ID, user.ID)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	targetID, err := uuid.Parse(r.PathValue("userId"))
+	if err != nil {
+		jsonError(w, "invalid user id", http.StatusBadRequest)
+		return
+	}
+
+	blockRepo := &database.BlockRepo{DB: s.db}
+	if err := blockRepo.Unblock(r.Context(), user.ID, targetID); err != nil {
+		jsonError(w, "failed to unblock user", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleListBlocks(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	blockRepo := &database.BlockRepo{DB: s.db}
+	blocked, err := blockRepo.ListBlocked(r.Context(), user.ID)
+	if err != nil {
+		jsonError(w, "failed to list blocked users", http.StatusInternalServerError)
+		return
+	}
+	if blocked == nil {
+		blocked = []models.User{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(blocked)
 }
 
 // --- Presence ---

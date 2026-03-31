@@ -303,97 +303,73 @@ func (r *ServerMemberRepo) IsMember(ctx context.Context, userID, serverID uuid.U
 	return exists, err
 }
 
-// FriendshipRepo handles friendship-related database operations.
-type FriendshipRepo struct {
+// BlockRepo handles user block operations.
+type BlockRepo struct {
 	DB *sql.DB
 }
 
-func (r *FriendshipRepo) CreateFriendRequest(ctx context.Context, f *models.Friendship) error {
-	f.ID = uuid.New()
-	now := time.Now()
-	f.CreatedAt = now
-	f.UpdatedAt = now
-	f.Status = "pending"
-
-	// Enforce user_a < user_b ordering per CHECK constraint
-	if f.UserA.String() > f.UserB.String() {
-		f.UserA, f.UserB = f.UserB, f.UserA
-	}
-
+func (r *BlockRepo) Block(ctx context.Context, blockerID, blockedID uuid.UUID) error {
 	_, err := r.DB.ExecContext(ctx,
-		`INSERT INTO friendships (id, user_a, user_b, status, initiated_by, dm_channel_id, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		f.ID, f.UserA, f.UserB, f.Status, f.InitiatedBy, f.DMChannelID, f.CreatedAt, f.UpdatedAt,
+		`INSERT INTO user_blocks (blocker_id, blocked_id, created_at) VALUES ($1, $2, NOW())
+		 ON CONFLICT DO NOTHING`,
+		blockerID, blockedID,
 	)
 	return err
 }
 
-func (r *FriendshipRepo) AcceptFriend(ctx context.Context, id uuid.UUID) error {
+func (r *BlockRepo) Unblock(ctx context.Context, blockerID, blockedID uuid.UUID) error {
 	_, err := r.DB.ExecContext(ctx,
-		`UPDATE friendships SET status = 'accepted', updated_at = $1 WHERE id = $2`,
-		time.Now(), id,
+		`DELETE FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2`,
+		blockerID, blockedID,
 	)
 	return err
 }
 
-func (r *FriendshipRepo) GetFriendship(ctx context.Context, userA, userB uuid.UUID) (*models.Friendship, error) {
-	// Enforce ordering to match CHECK constraint
-	if userA.String() > userB.String() {
-		userA, userB = userB, userA
-	}
-
-	f := &models.Friendship{}
+func (r *BlockRepo) IsBlocked(ctx context.Context, userA, userB uuid.UUID) (bool, error) {
+	var exists bool
 	err := r.DB.QueryRowContext(ctx,
-		`SELECT id, user_a, user_b, status, initiated_by, dm_channel_id, created_at, updated_at
-		 FROM friendships WHERE user_a = $1 AND user_b = $2`, userA, userB,
-	).Scan(&f.ID, &f.UserA, &f.UserB, &f.Status, &f.InitiatedBy, &f.DMChannelID, &f.CreatedAt, &f.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return f, nil
+		`SELECT EXISTS(
+			SELECT 1 FROM user_blocks
+			WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)
+		)`, userA, userB,
+	).Scan(&exists)
+	return exists, err
 }
 
-func (r *FriendshipRepo) ListFriends(ctx context.Context, userID uuid.UUID) ([]models.Friendship, error) {
+func (r *BlockRepo) ListBlocked(ctx context.Context, blockerID uuid.UUID) ([]models.User, error) {
 	rows, err := r.DB.QueryContext(ctx,
-		`SELECT id, user_a, user_b, status, initiated_by, dm_channel_id, created_at, updated_at
-		 FROM friendships
-		 WHERE (user_a = $1 OR user_b = $1) AND status = 'accepted'
-		 ORDER BY updated_at DESC`, userID,
+		`SELECT u.id, u.username, u.display_name, u.avatar_path, u.tailscale_id, u.password_hash, u.status, u.created_at, u.updated_at
+		 FROM user_blocks b
+		 JOIN users u ON u.id = b.blocked_id
+		 WHERE b.blocker_id = $1
+		 ORDER BY b.created_at DESC`, blockerID,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var friends []models.Friendship
+	var users []models.User
 	for rows.Next() {
-		var f models.Friendship
-		if err := rows.Scan(&f.ID, &f.UserA, &f.UserB, &f.Status, &f.InitiatedBy, &f.DMChannelID, &f.CreatedAt, &f.UpdatedAt); err != nil {
+		var u models.User
+		if err := rows.Scan(&u.ID, &u.Username, &u.DisplayName, &u.AvatarPath, &u.TailscaleID, &u.PasswordHash, &u.Status, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, err
 		}
-		friends = append(friends, f)
+		users = append(users, u)
 	}
-	return friends, rows.Err()
+	return users, rows.Err()
 }
 
-func (r *FriendshipRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.Friendship, error) {
-	f := &models.Friendship{}
+func (r *ServerMemberRepo) ShareServer(ctx context.Context, userA, userB uuid.UUID) (bool, error) {
+	var exists bool
 	err := r.DB.QueryRowContext(ctx,
-		`SELECT id, user_a, user_b, status, initiated_by, dm_channel_id, created_at, updated_at
-		 FROM friendships WHERE id = $1`, id,
-	).Scan(&f.ID, &f.UserA, &f.UserB, &f.Status, &f.InitiatedBy, &f.DMChannelID, &f.CreatedAt, &f.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return f, nil
-}
-
-func (r *FriendshipRepo) SetDMChannelID(ctx context.Context, id, channelID uuid.UUID) error {
-	_, err := r.DB.ExecContext(ctx,
-		`UPDATE friendships SET dm_channel_id = $1, updated_at = $2 WHERE id = $3`,
-		channelID, time.Now(), id,
-	)
-	return err
+		`SELECT EXISTS(
+			SELECT 1 FROM server_members m1
+			JOIN server_members m2 ON m1.server_id = m2.server_id
+			WHERE m1.user_id = $1 AND m2.user_id = $2
+		)`, userA, userB,
+	).Scan(&exists)
+	return exists, err
 }
 
 // UserRepo helper: look up a user by username.
@@ -455,6 +431,71 @@ func (r *DMMemberRepo) IsMember(ctx context.Context, channelID, userID uuid.UUID
 		channelID, userID,
 	).Scan(&exists)
 	return exists, err
+}
+
+func (r *DMMemberRepo) FindDMChannel(ctx context.Context, userA, userB uuid.UUID) (*models.Channel, error) {
+	c := &models.Channel{}
+	err := r.DB.QueryRowContext(ctx,
+		`SELECT c.id, c.server_id, c.name, c.topic, c.type, c.position, c.created_at
+		 FROM channels c
+		 JOIN dm_members m1 ON m1.channel_id = c.id
+		 JOIN dm_members m2 ON m2.channel_id = c.id
+		 WHERE c.server_id IS NULL AND m1.user_id = $1 AND m2.user_id = $2`,
+		userA, userB,
+	).Scan(&c.ID, &c.ServerID, &c.Name, &c.Topic, &c.Type, &c.Position, &c.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (r *DMMemberRepo) ListUserDMs(ctx context.Context, userID uuid.UUID) ([]models.DMChannelView, error) {
+	rows, err := r.DB.QueryContext(ctx,
+		`SELECT c.id, c.server_id, c.name, c.topic, c.type, c.position, c.created_at,
+		        u.id, u.username, u.display_name, u.avatar_path, u.tailscale_id, u.password_hash, u.status, u.created_at, u.updated_at,
+		        (SELECT MAX(m.created_at) FROM messages m WHERE m.channel_id = c.id)
+		 FROM dm_members me
+		 JOIN channels c ON c.id = me.channel_id
+		 JOIN dm_members other ON other.channel_id = c.id AND other.user_id != $1
+		 JOIN users u ON u.id = other.user_id
+		 WHERE me.user_id = $1 AND me.closed = false AND c.server_id IS NULL
+		 ORDER BY (SELECT MAX(m.created_at) FROM messages m WHERE m.channel_id = c.id) DESC NULLS LAST`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var views []models.DMChannelView
+	for rows.Next() {
+		var v models.DMChannelView
+		if err := rows.Scan(
+			&v.Channel.ID, &v.Channel.ServerID, &v.Channel.Name, &v.Channel.Topic, &v.Channel.Type, &v.Channel.Position, &v.Channel.CreatedAt,
+			&v.OtherUser.ID, &v.OtherUser.Username, &v.OtherUser.DisplayName, &v.OtherUser.AvatarPath, &v.OtherUser.TailscaleID, &v.OtherUser.PasswordHash, &v.OtherUser.Status, &v.OtherUser.CreatedAt, &v.OtherUser.UpdatedAt,
+			&v.LastMessageAt,
+		); err != nil {
+			return nil, err
+		}
+		views = append(views, v)
+	}
+	return views, rows.Err()
+}
+
+func (r *DMMemberRepo) CloseDM(ctx context.Context, channelID, userID uuid.UUID) error {
+	_, err := r.DB.ExecContext(ctx,
+		`UPDATE dm_members SET closed = true WHERE channel_id = $1 AND user_id = $2`,
+		channelID, userID,
+	)
+	return err
+}
+
+func (r *DMMemberRepo) ReopenDM(ctx context.Context, channelID, userID uuid.UUID) error {
+	_, err := r.DB.ExecContext(ctx,
+		`UPDATE dm_members SET closed = false WHERE channel_id = $1 AND user_id = $2`,
+		channelID, userID,
+	)
+	return err
 }
 
 // MessageRepo handles message-related database operations.

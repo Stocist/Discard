@@ -6,8 +6,10 @@
 	import { listServers, createServer, fetchMe, deleteServer, joinServer } from '$lib/api';
 	import { subscribeServerEvents } from '$lib/ws';
 	import ContextMenu from './ContextMenu.svelte';
+	import DMPanel from './DMPanel.svelte';
 
 	let servers = $state<Server[]>([]);
+	let showDMs = $state(false);
 	let showCreateModal = $state(false);
 	let newServerName = $state('');
 	let loading = $state(false);
@@ -131,6 +133,7 @@
 			if (confirmDeleteServerId) { confirmDeleteServerId = null; return; }
 			if (showCreateModal) { showCreateModal = false; newServerName = ''; return; }
 			if (showJoinModal) { showJoinModal = false; joinCode = ''; joinError = ''; return; }
+			if (showDMs) { showDMs = false; return; }
 		}
 	}
 </script>
@@ -138,6 +141,14 @@
 <svelte:window onkeydown={handleGlobalKeydown} />
 
 <nav class="server-bar">
+	<button class="server-icon dm-btn" title="Direct Messages" onclick={() => (showDMs = true)}>
+		<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+			<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+		</svg>
+	</button>
+
+	<div class="separator"></div>
+
 	<div class="servers">
 		{#each servers as server (server.id)}
 			<button
@@ -228,6 +239,10 @@
 	</div>
 {/if}
 
+{#if showDMs}
+	<DMPanel onclose={() => (showDMs = false)} />
+{/if}
+
 {#if confirmDeleteServerId}
 	{@const serverToDelete = servers.find(s => s.id === confirmDeleteServerId)}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -303,6 +318,16 @@
 	}
 
 	.add-btn:hover {
+		background: var(--accent);
+		color: white;
+		border-radius: 16px;
+	}
+
+	.dm-btn {
+		color: var(--text-muted);
+	}
+
+	.dm-btn:hover {
 		background: var(--accent);
 		color: white;
 		border-radius: 16px;

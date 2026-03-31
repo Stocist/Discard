@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS user_blocks (
+    blocker_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    blocked_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (blocker_id, blocked_id)
+);
+
+ALTER TABLE dm_members ADD COLUMN IF NOT EXISTS closed BOOLEAN DEFAULT FALSE;
+
+DROP TABLE IF EXISTS friendships;

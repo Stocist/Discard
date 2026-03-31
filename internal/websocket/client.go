@@ -77,6 +77,8 @@ type VoiceHandler interface {
 	GetAllVoiceStates() map[uuid.UUID][]VoiceParticipantState
 	StartScreenShare(channelID, userID uuid.UUID) bool
 	StopScreenShare(channelID, userID uuid.UUID)
+	StartCamera(channelID, userID uuid.UUID)
+	StopCamera(channelID, userID uuid.UUID)
 }
 
 // VoiceParticipantState is the WS-package view of a voice participant.
@@ -87,6 +89,7 @@ type VoiceParticipantState struct {
 	Muted         bool      `json:"muted"`
 	Deafened      bool      `json:"deafened"`
 	ScreenSharing bool      `json:"screen_sharing"`
+	CameraOn      bool      `json:"camera_on"`
 }
 
 // incomingMessage is the envelope for messages from the browser.
@@ -194,6 +197,10 @@ func (c *Client) ReadPump() {
 			c.handleScreenShareStart(msg)
 		case "screen_share_stop":
 			c.handleScreenShareStop(msg)
+		case "voice_camera_start":
+			c.handleCameraStart(msg)
+		case "voice_camera_stop":
+			c.handleCameraStop(msg)
 
 		default:
 			log.Printf("ws unknown message type: %s", msg.Type)
@@ -428,6 +435,29 @@ func (c *Client) handleScreenShareStop(msg incomingMessage) {
 	c.hub.BroadcastAll(data)
 }
 
+func (c *Client) handleCameraStart(msg incomingMessage) {
+	if c.OnVoice == nil {
+		return
+	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		c.sendError("invalid channel_id")
+		return
+	}
+	c.OnVoice.StartCamera(channelID, c.UserID)
+}
+
+func (c *Client) handleCameraStop(msg incomingMessage) {
+	if c.OnVoice == nil {
+		return
+	}
+	channelID, err := uuid.Parse(msg.ChannelID)
+	if err != nil {
+		return
+	}
+	c.OnVoice.StopCamera(channelID, c.UserID)
+}
+
 func (c *Client) handleChatMessage(msg incomingMessage) {
 	if msg.Content == "" || c.OnMessage == nil {
 		return
@@ -440,6 +470,19 @@ func (c *Client) handleChatMessage(msg incomingMessage) {
 	if err != nil {
 		c.sendError("invalid channel_id")
 		return
+	}
+
+	if c.CheckMembership != nil {
+		ok, err := c.CheckMembership(context.Background(), c.UserID, channelID)
+		if err != nil {
+			log.Printf("ws membership check error: %v", err)
+			c.sendError("failed to verify channel membership")
+			return
+		}
+		if !ok {
+			c.sendError("not a member of this channel")
+			return
+		}
 	}
 
 	saved, err := c.OnMessage(context.Background(), channelID, c.UserID, msg.Content)

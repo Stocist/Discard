@@ -1,4 +1,4 @@
-import type { Server, Channel, Message, ServerMember, Friendship, User } from './types';
+import type { Server, Channel, Message, ServerMember, User, DMChannelView } from './types';
 
 class ApiError extends Error {
 	constructor(
@@ -45,6 +45,12 @@ export async function fetchTailscaleStatus(): Promise<TailscaleStatus> {
 		throw new Error(`Tailscale status check failed: ${res.status}`);
 	}
 	return res.json();
+}
+
+/** Resolve an avatar path: external URLs pass through, relative paths get /uploads/ prefix. */
+export function avatarSrc(path: string): string {
+	if (path.startsWith('http://') || path.startsWith('https://')) return path;
+	return `/uploads/${path}`;
 }
 
 // Auth / user
@@ -202,20 +208,30 @@ export function deleteMessage(messageId: string): Promise<void> {
 	return apiFetch(`/messages/${messageId}`, { method: 'DELETE' });
 }
 
-// Friends
-export function sendFriendRequest(username: string): Promise<Friendship> {
-	return apiFetch('/friends/requests', {
-		method: 'POST',
-		body: JSON.stringify({ username })
-	});
+// DMs
+export function openDM(userId: string): Promise<DMChannelView> {
+	return apiFetch('/dm/open', { method: 'POST', body: JSON.stringify({ user_id: userId }) });
 }
 
-export function acceptFriend(friendshipId: string): Promise<Friendship> {
-	return apiFetch(`/friends/requests/${friendshipId}/accept`, { method: 'POST' });
+export function listDMs(): Promise<DMChannelView[]> {
+	return apiFetch('/dm');
 }
 
-export function listFriends(): Promise<Friendship[]> {
-	return apiFetch('/friends');
+export function closeDM(channelId: string): Promise<void> {
+	return apiFetch(`/dm/${channelId}/close`, { method: 'PUT' });
+}
+
+// Blocks
+export function blockUser(userId: string): Promise<void> {
+	return apiFetch('/blocks', { method: 'POST', body: JSON.stringify({ user_id: userId }) });
+}
+
+export function unblockUser(userId: string): Promise<void> {
+	return apiFetch(`/blocks/${userId}`, { method: 'DELETE' });
+}
+
+export function listBlocks(): Promise<User[]> {
+	return apiFetch('/blocks');
 }
 
 // Read state / unread

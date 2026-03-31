@@ -23,7 +23,7 @@ export function isUserOnline(userId: string): boolean {
 }
 
 // Server event callbacks (update/delete).
-import type { Server } from './types';
+import type { Server, Channel, User } from './types';
 
 type ServerEventHandler = (event: { type: 'server_update'; server: Server } | { type: 'server_delete'; server_id: string }) => void;
 let serverListeners = new Set<ServerEventHandler>();
@@ -53,6 +53,36 @@ function handlePresenceMessage(data: { type: string; user_id?: string; status?: 
 		onlineSet = new Set(data.user_ids);
 		notify();
 	}
+}
+
+// DM event callbacks.
+type DMEvent = { type: 'dm_opened'; channel: Channel; opener: User };
+type DMEventHandler = (event: DMEvent) => void;
+let dmListeners = new Set<DMEventHandler>();
+
+export function subscribeDMEvents(fn: DMEventHandler): () => void {
+	dmListeners.add(fn);
+	return () => dmListeners.delete(fn);
+}
+
+// Member joined callbacks — notified when a user joins a server.
+export interface MemberJoinedEvent {
+	type: 'member_joined';
+	server_id: string;
+	member: {
+		user_id: string;
+		username: string;
+		display_name: string | null;
+		avatar_url: string | null;
+		role: string;
+	};
+}
+type MemberJoinedHandler = (event: MemberJoinedEvent) => void;
+let memberJoinedListeners = new Set<MemberJoinedHandler>();
+
+export function subscribeMemberJoined(fn: MemberJoinedHandler): () => void {
+	memberJoinedListeners.add(fn);
+	return () => memberJoinedListeners.delete(fn);
 }
 
 // Unread message callbacks — notified with channel_id when a new message arrives.
@@ -93,6 +123,10 @@ export function createWSConnection(opts?: { handleVoice?: boolean }): WebSocket 
 				handlePresenceMessage(data);
 			} else if (data.type === 'server_update' || data.type === 'server_delete') {
 				handleServerMessage(data);
+			} else if (data.type === 'dm_opened' && data.channel && data.opener) {
+				for (const fn of dmListeners) fn(data as DMEvent);
+			} else if (data.type === 'member_joined' && data.server_id && data.member) {
+				for (const fn of memberJoinedListeners) fn(data as MemberJoinedEvent);
 			} else if (data.type === 'message' && data.message?.channel_id) {
 				for (const fn of unreadListeners) fn(data.message.channel_id);
 			}

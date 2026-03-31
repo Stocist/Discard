@@ -64,15 +64,10 @@ export interface ServerMember {
 	avatar_url?: string | null;
 }
 
-export interface Friendship {
-	id: string;
-	user_a: string;
-	user_b: string;
-	status: string;
-	initiated_by: string;
-	dm_channel_id: string | null;
-	created_at: string;
-	updated_at: string;
+export interface DMChannelView {
+	channel: Channel;
+	other_user: User;
+	last_message_at: string | null;
 }
 
 export interface WSMessage {

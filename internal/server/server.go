@@ -84,10 +84,15 @@ func (s *Server) SetupRoutes() {
 	a("GET /api/servers/{id}/members", s.handleListMembers)
 	a("DELETE /api/servers/{id}/members/me", s.handleLeaveServer)
 
-	// Friends
-	a("POST /api/friends/requests", s.handleSendFriendRequest)
-	a("POST /api/friends/requests/{id}/accept", s.handleAcceptFriend)
-	a("GET /api/friends", s.handleListFriends)
+	// DMs
+	a("POST /api/dm/open", s.handleOpenDM)
+	a("GET /api/dm", s.handleListDMs)
+	a("PUT /api/dm/{channelId}/close", s.handleCloseDM)
+
+	// Blocks
+	a("POST /api/blocks", s.handleBlock)
+	a("DELETE /api/blocks/{userId}", s.handleUnblock)
+	a("GET /api/blocks", s.handleListBlocks)
 
 	// Messages
 	a("GET /api/channels/{id}/messages", s.handleListMessages)

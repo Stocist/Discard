@@ -73,15 +73,16 @@ type ServerMember struct {
 	AvatarURL   *string  `json:"avatar_url,omitempty"`
 }
 
-type Friendship struct {
-	ID          uuid.UUID  `json:"id"`
-	UserA       uuid.UUID  `json:"user_a"`
-	UserB       uuid.UUID  `json:"user_b"`
-	Status      string     `json:"status"`
-	InitiatedBy uuid.UUID  `json:"initiated_by"`
-	DMChannelID *uuid.UUID `json:"dm_channel_id"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+type UserBlock struct {
+	BlockerID uuid.UUID `json:"blocker_id"`
+	BlockedID uuid.UUID `json:"blocked_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type DMChannelView struct {
+	Channel       Channel    `json:"channel"`
+	OtherUser     User       `json:"other_user"`
+	LastMessageAt *time.Time `json:"last_message_at"`
 }
 
 type DMMember struct {
