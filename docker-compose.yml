@@ -1,14 +1,39 @@
 services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    hostname: discard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_SOCKET=/var/run/tailscale/tailscaled.sock
+      - TS_SERVE_CONFIG=/config/tailscale-serve.json
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - tailscale-sock:/var/run/tailscale
+      - ./tailscale-serve.json:/config/tailscale-serve.json:ro
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      - internal
+    restart: unless-stopped
+
   discard:
     build: .
-    ports:
-      - "4000:4000"
+    network_mode: service:tailscale
     environment:
       - DATABASE_URL=postgres://discard:discard@postgres:5432/discard?sslmode=disable
       - UPLOAD_DIR=/data/uploads
+      - TAILSCALE_SOCK=/var/run/tailscale/tailscaled.sock
     volumes:
       - uploads:/data/uploads
+      - tailscale-sock:/var/run/tailscale:ro
     depends_on:
+      tailscale:
+        condition: service_started
       postgres:
         condition: service_healthy
 
@@ -20,12 +45,19 @@ services:
       POSTGRES_DB: discard
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U discard"]
       interval: 5s
       timeout: 3s
       retries: 5
 
+networks:
+  internal:
+
 volumes:
   pgdata:
   uploads:
+  tailscale-state:
+  tailscale-sock:

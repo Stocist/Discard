@@ -49,14 +49,15 @@ func Middleware(repo UserRepo) func(http.Handler) http.Handler {
 		log.Println("WARNING: Running in dev mode — authentication is disabled. Do NOT use in production.")
 	}
 
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := tailscaleClient()
 
-	// Tailscale local API: on Linux it's http://127.0.0.1:41112 with no auth.
-	// On macOS (App Store) it's a dynamic port with a token.
-	// Override via TAILSCALE_API_URL and TAILSCALE_API_TOKEN env vars.
 	tsAPIURL := os.Getenv("TAILSCALE_API_URL")
 	if tsAPIURL == "" {
-		tsAPIURL = "http://127.0.0.1:41112"
+		if os.Getenv("TAILSCALE_SOCK") != "" {
+			tsAPIURL = "http://local-tailscaled.sock"
+		} else {
+			tsAPIURL = "http://127.0.0.1:41112"
+		}
 	}
 	tsAPIToken := os.Getenv("TAILSCALE_API_TOKEN")
 
@@ -151,15 +152,36 @@ func devUser(ctx context.Context, repo UserRepo, r *http.Request) (*models.User,
 // TailscaleStatus checks if the request comes from a Tailscale user and returns
 // their user model (or auto-creates them). Used by the public status endpoint.
 func TailscaleStatus(r *http.Request, repo UserRepo) (*models.User, error) {
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := tailscaleClient()
 
 	tsAPIURL := os.Getenv("TAILSCALE_API_URL")
 	if tsAPIURL == "" {
-		tsAPIURL = "http://127.0.0.1:41112"
+		if os.Getenv("TAILSCALE_SOCK") != "" {
+			tsAPIURL = "http://local-tailscaled.sock"
+		} else {
+			tsAPIURL = "http://127.0.0.1:41112"
+		}
 	}
 	tsAPIToken := os.Getenv("TAILSCALE_API_TOKEN")
 
 	return tailscaleAuth(r.Context(), repo, client, r.RemoteAddr, tsAPIURL, tsAPIToken)
+}
+
+// tailscaleClient returns an HTTP client configured for the Tailscale local API.
+// When TAILSCALE_SOCK is set, it dials via Unix socket instead of TCP.
+func tailscaleClient() *http.Client {
+	sockPath := os.Getenv("TAILSCALE_SOCK")
+	if sockPath == "" {
+		return &http.Client{Timeout: 3 * time.Second}
+	}
+	return &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", sockPath)
+			},
+		},
+	}
 }
 
 // tailscaleAuth authenticates via the Tailscale local API.
