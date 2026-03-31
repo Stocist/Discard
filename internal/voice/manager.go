@@ -260,6 +260,30 @@ func (m *Manager) StopScreenShare(channelID, userID uuid.UUID) {
 	m.broadcastVoiceState(channelID)
 }
 
+// StartCamera starts camera for a user in a channel.
+func (m *Manager) StartCamera(channelID, userID uuid.UUID) {
+	m.mu.RLock()
+	session, ok := m.sessions[channelID]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	session.StartCamera(userID)
+	m.broadcastVoiceState(channelID)
+}
+
+// StopCamera stops camera for a user in a channel.
+func (m *Manager) StopCamera(channelID, userID uuid.UUID) {
+	m.mu.RLock()
+	session, ok := m.sessions[channelID]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	session.StopCamera(userID)
+	m.broadcastVoiceState(channelID)
+}
+
 // broadcastVoiceState sends the current voice state for a channel to all clients.
 func (m *Manager) broadcastVoiceState(channelID uuid.UUID) {
 	m.mu.RLock()

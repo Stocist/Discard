@@ -54,6 +54,14 @@ func (a *Adapter) StopScreenShare(channelID, userID uuid.UUID) {
 	a.mgr.StopScreenShare(channelID, userID)
 }
 
+func (a *Adapter) StartCamera(channelID, userID uuid.UUID) {
+	a.mgr.StartCamera(channelID, userID)
+}
+
+func (a *Adapter) StopCamera(channelID, userID uuid.UUID) {
+	a.mgr.StopCamera(channelID, userID)
+}
+
 func (a *Adapter) GetAllVoiceStates() map[uuid.UUID][]ws.VoiceParticipantState {
 	raw := a.mgr.GetAllVoiceStates()
 	result := make(map[uuid.UUID][]ws.VoiceParticipantState, len(raw))
@@ -67,6 +75,7 @@ func (a *Adapter) GetAllVoiceStates() map[uuid.UUID][]ws.VoiceParticipantState {
 				Muted:         p.Muted,
 				Deafened:      p.Deafened,
 				ScreenSharing: p.ScreenSharing,
+				CameraOn:      p.CameraOn,
 			}
 		}
 		result[channelID] = wsParticipants

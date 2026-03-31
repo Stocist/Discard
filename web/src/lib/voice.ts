@@ -9,6 +9,7 @@ export interface VoiceParticipant {
 	deafened: boolean;
 	speaking: boolean;
 	screen_sharing: boolean;
+	camera_on: boolean;
 }
 
 // Module state (plain variables, NOT $state)
@@ -31,6 +32,12 @@ let screenSharerUsername: string | null = null;
 let screenShareChannelId: string | null = null;
 let screenShareListeners = new Set<() => void>();
 let remoteScreenStream: MediaStream | null = null;
+
+// Camera state
+let cameraStream: MediaStream | null = null;
+let cameraOn = false;
+let cameraParticipants: Map<string, MediaStream> = new Map(); // remote camera streams keyed by user ID
+let cameraListeners = new Set<() => void>();
 
 // Error state — surfaced to UI
 let lastError: string | null = null;
@@ -96,6 +103,10 @@ export function leaveVoice(ws: WebSocket): void {
 	if (screenSharing) {
 		stopScreenShare(ws);
 	}
+	// Stop camera if active
+	if (cameraOn) {
+		stopCamera(ws);
+	}
 	wsSend(ws, { type: 'voice_leave', channel_id: currentChannelId });
 	stopSpeakingDetection();
 	if (pc) {
@@ -113,11 +124,13 @@ export function leaveVoice(ws: WebSocket): void {
 	screenSharerUserId = null;
 	screenSharerUsername = null;
 	screenShareChannelId = null;
+	cameraParticipants.clear();
 	currentChannelId = null;
 	muted = false;
 	deafened = false;
 	notify();
 	notifyScreenShare();
+	notifyCamera();
 }
 
 export function toggleMute(ws: WebSocket): void {
@@ -204,7 +217,86 @@ export function getRemoteScreenStream(): MediaStream | null {
 	return remoteScreenStream;
 }
 
-export async function startScreenShare(ws: WebSocket): Promise<void> {
+// Camera state accessors
+function notifyCamera() {
+	for (const fn of cameraListeners) fn();
+}
+
+export function subscribeCameraState(fn: () => void): () => void {
+	cameraListeners.add(fn);
+	return () => cameraListeners.delete(fn);
+}
+
+export function isCameraOn(): boolean {
+	return cameraOn;
+}
+
+export function getCameraParticipants(): Map<string, MediaStream> {
+	return cameraParticipants;
+}
+
+export function getLocalCameraStream(): MediaStream | null {
+	return cameraStream;
+}
+
+export async function startCamera(ws: WebSocket): Promise<void> {
+	if (!currentChannelId || !pc) {
+		setError('Must be in a voice channel to use camera');
+		return;
+	}
+	if (cameraOn) return;
+
+	try {
+		cameraStream = await navigator.mediaDevices.getUserMedia({
+			video: { width: { ideal: 640 }, height: { ideal: 480 } },
+			audio: false
+		});
+
+		// Add camera video track to the existing PeerConnection with a "camera-" stream ID
+		for (const track of cameraStream.getTracks()) {
+			const cameraMediaStream = new MediaStream([track]);
+			// Override stream ID by creating a custom one — use addTrack with custom stream
+			pc.addTrack(track, cameraMediaStream);
+		}
+
+		cameraOn = true;
+		wsSend(ws, { type: 'voice_camera_start', channel_id: currentChannelId });
+		notify();
+		notifyCamera();
+	} catch (e) {
+		if (e instanceof DOMException && e.name === 'NotAllowedError') {
+			return;
+		}
+		const msg = e instanceof Error ? e.message : String(e);
+		setError('Camera failed: ' + msg);
+	}
+}
+
+export function stopCamera(ws: WebSocket): void {
+	if (!cameraOn) return;
+
+	if (cameraStream) {
+		if (pc) {
+			for (const track of cameraStream.getTracks()) {
+				const sender = pc.getSenders().find(s => s.track === track);
+				if (sender) {
+					pc.removeTrack(sender);
+				}
+			}
+		}
+		cameraStream.getTracks().forEach(t => t.stop());
+		cameraStream = null;
+	}
+
+	cameraOn = false;
+	if (currentChannelId) {
+		wsSend(ws, { type: 'voice_camera_stop', channel_id: currentChannelId });
+	}
+	notify();
+	notifyCamera();
+}
+
+export async function startScreenShare(ws: WebSocket, resolution?: string): Promise<void> {
 	if (!currentChannelId || !pc) {
 		setError('Must be in a voice channel to share screen');
 		return;
@@ -216,8 +308,17 @@ export async function startScreenShare(ws: WebSocket): Promise<void> {
 	}
 
 	try {
+		let videoConstraints: boolean | MediaTrackConstraints = true;
+		if (resolution === '720p') {
+			videoConstraints = { height: { ideal: 720 } };
+		} else if (resolution === '1080p') {
+			videoConstraints = { height: { ideal: 1080 } };
+		} else if (resolution === '4k') {
+			videoConstraints = { height: { ideal: 2160 } };
+		}
+
 		screenStream = await navigator.mediaDevices.getDisplayMedia({
-			video: true,
+			video: videoConstraints,
 			audio: true
 		});
 
@@ -304,6 +405,12 @@ export function cleanupVoiceOnDisconnect(): void {
 		screenStream = null;
 	}
 	screenSharing = false;
+	if (cameraStream) {
+		cameraStream.getTracks().forEach(t => t.stop());
+		cameraStream = null;
+	}
+	cameraOn = false;
+	cameraParticipants.clear();
 	if (pc) {
 		pc.close();
 		pc = null;
@@ -325,6 +432,7 @@ export function cleanupVoiceOnDisconnect(): void {
 		deafened = false;
 		notify();
 		notifyScreenShare();
+		notifyCamera();
 	}
 }
 
@@ -487,6 +595,32 @@ async function handleOffer(ws: WebSocket, data: Record<string, unknown>) {
 			const trackId = event.track.id;
 			const streamId = stream.id;
 			console.log('[voice] ontrack: track kind=%s, stream id=%s, track id=%s', event.track.kind, streamId, trackId);
+
+			// Camera tracks have stream ID starting with "camera-"
+			if (streamId.startsWith('camera-')) {
+				if (event.track.kind === 'video') {
+					// Extract user ID from stream ID: "camera-{userId}"
+					const cameraUserId = streamId.slice(7); // "camera-".length = 7
+					let cameraStream = cameraParticipants.get(cameraUserId);
+					if (!cameraStream) {
+						cameraStream = new MediaStream();
+						cameraParticipants.set(cameraUserId, cameraStream);
+					}
+					cameraStream.addTrack(event.track);
+					event.track.addEventListener('ended', () => {
+						const s = cameraParticipants.get(cameraUserId);
+						if (s) {
+							s.removeTrack(event.track);
+							if (s.getTracks().length === 0) {
+								cameraParticipants.delete(cameraUserId);
+							}
+						}
+						notifyCamera();
+					});
+					notifyCamera();
+				}
+				return;
+			}
 
 			// Screen share tracks have stream ID starting with "screen-"
 			if (streamId.startsWith('screen-')) {

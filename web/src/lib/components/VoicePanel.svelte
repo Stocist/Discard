@@ -1,12 +1,16 @@
 <script lang="ts">
-	import { toggleMute, toggleDeafen, leaveVoice, isMuted, isDeafened, isSelfSpeaking, getParticipants, subscribeVoice, getVoiceChannelId, startMicTest, getVoiceError, subscribeVoiceError, startScreenShare, stopScreenShare, isScreenSharing, subscribeScreenShare, getScreenSharerUserId } from '$lib/voice';
+	import { toggleMute, toggleDeafen, leaveVoice, isMuted, isDeafened, isSelfSpeaking, getParticipants, subscribeVoice, getVoiceChannelId, startMicTest, getVoiceError, subscribeVoiceError, startScreenShare, stopScreenShare, isScreenSharing, subscribeScreenShare, getScreenSharerUserId, startCamera, stopCamera, isCameraOn, subscribeCameraState } from '$lib/voice';
 	import type { VoiceParticipant } from '$lib/voice';
+	import { avatarSrc } from '$lib/api';
+	import VideoGrid from './VideoGrid.svelte';
 
-	let { ws, channelName }: {
+	let { ws, channelName, userId }: {
 		ws: WebSocket | undefined;
 		channelName: string;
+		userId: string;
 	} = $props();
 
+	let failedAvatars = $state(new Set<string>());
 	let voiceState = $state(0);
 	let voiceError = $state<string | null>(null);
 	$effect(() => {
@@ -69,6 +73,7 @@
 	// Screen share state
 	const canScreenShare = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia;
 	let screenShareState = $state(0);
+	let selectedResolution = $state('auto');
 	$effect(() => {
 		return subscribeScreenShare(() => { screenShareState++; });
 	});
@@ -80,7 +85,29 @@
 		if (sharing) {
 			stopScreenShare(ws);
 		} else {
-			startScreenShare(ws);
+			const res = selectedResolution === 'auto' ? undefined : selectedResolution;
+			startScreenShare(ws, res);
+		}
+	}
+
+	// Camera state
+	let cameraStateVersion = $state(0);
+	$effect(() => {
+		return subscribeCameraState(() => { cameraStateVersion++; });
+	});
+	const cameraActive = $derived.by(() => { cameraStateVersion; return isCameraOn(); });
+	const anyCameraOn = $derived.by(() => {
+		cameraStateVersion;
+		voiceState;
+		return cameraActive || participants.some(p => p.camera_on);
+	});
+
+	function handleCamera() {
+		if (!ws) return;
+		if (cameraActive) {
+			stopCamera(ws);
+		} else {
+			startCamera(ws);
 		}
 	}
 
@@ -95,11 +122,14 @@
 		<span class="voice-label">Voice Connected</span>
 		<span class="voice-channel">{channelName}</span>
 	</div>
+	{#if anyCameraOn}
+		<VideoGrid {participants} localUserId={userId} />
+	{/if}
 	<div class="voice-participants">
 		{#each participants as p (p.user_id)}
 			<div class="voice-participant" class:speaking={p.speaking}>
-				{#if p.avatar_path}
-					<img class="voice-avatar" src="/uploads/{p.avatar_path}" alt="" />
+				{#if p.avatar_path && !failedAvatars.has(p.avatar_path)}
+					<img class="voice-avatar" src={avatarSrc(p.avatar_path!)} alt="" onerror={() => { failedAvatars.add(p.avatar_path!); failedAvatars = failedAvatars; }} />
 				{:else}
 					<span class="voice-avatar voice-avatar-fallback">{(p.username ?? '?').charAt(0).toUpperCase()}</span>
 				{/if}
@@ -134,7 +164,33 @@
 	{#if micTestError}
 		<div class="voice-error">{micTestError}</div>
 	{/if}
+	{#if canScreenShare}
+		<div class="screen-share-row">
+			<select class="resolution-select" bind:value={selectedResolution} disabled={sharing}>
+				<option value="auto">Auto</option>
+				<option value="720p">720p</option>
+				<option value="1080p">1080p</option>
+				<option value="4k">4K</option>
+			</select>
+		</div>
+	{/if}
 	<div class="voice-controls">
+		<button
+			class="voice-btn"
+			class:active={cameraActive}
+			title={cameraActive ? 'Turn Off Camera' : 'Turn On Camera'}
+			onclick={handleCamera}
+		>
+			{#if cameraActive}
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+					<path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
+				</svg>
+			{:else}
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+					<path d="M21 6.5l-4 4V7c0-.55-.45-1-1-1H9.82L21 17.18V6.5zM3.27 2L2 3.27 4.73 6H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.21 0 .39-.08.54-.18L19.73 21 21 19.73 3.27 2z"/>
+				</svg>
+			{/if}
+		</button>
 		{#if canScreenShare || someoneSharing}
 			<button
 				class="voice-btn"
@@ -373,5 +429,29 @@
 		background: var(--accent);
 		border-radius: 3px;
 		transition: width 0.05s linear;
+	}
+
+	.screen-share-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-bottom: 6px;
+	}
+
+	.resolution-select {
+		flex: 1;
+		font-size: 11px;
+		padding: 3px 6px;
+		border-radius: 4px;
+		background: var(--bg-tertiary);
+		color: var(--text-muted);
+		border: 1px solid var(--border);
+		cursor: pointer;
+		appearance: auto;
+	}
+
+	.resolution-select:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
 	}
 </style>
