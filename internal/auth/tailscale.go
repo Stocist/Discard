@@ -81,7 +81,7 @@ func Middleware(repo UserRepo) func(http.Handler) http.Handler {
 				}
 				user, err = devUser(ctx, repo, r)
 			} else {
-				user, err = tailscaleAuth(ctx, repo, client, r.RemoteAddr, tsAPIURL, tsAPIToken)
+				user, err = tailscaleAuth(ctx, repo, client, r, tsAPIURL, tsAPIToken)
 			}
 
 			if err != nil {
@@ -164,7 +164,7 @@ func TailscaleStatus(r *http.Request, repo UserRepo) (*models.User, error) {
 	}
 	tsAPIToken := os.Getenv("TAILSCALE_API_TOKEN")
 
-	return tailscaleAuth(r.Context(), repo, client, r.RemoteAddr, tsAPIURL, tsAPIToken)
+	return tailscaleAuth(r.Context(), repo, client, r, tsAPIURL, tsAPIToken)
 }
 
 // tailscaleClient returns an HTTP client configured for the Tailscale local API.
@@ -185,34 +185,19 @@ func tailscaleClient() *http.Client {
 }
 
 // tailscaleAuth authenticates via the Tailscale local API.
-func tailscaleAuth(ctx context.Context, repo UserRepo, client *http.Client, remoteAddr, apiURL, apiToken string) (*models.User, error) {
-	host, _, err := net.SplitHostPort(remoteAddr)
+// First tries whois with RemoteAddr (direct Tailscale connections).
+// Falls back to X-Forwarded-For when behind tailscale serve proxy.
+func tailscaleAuth(ctx context.Context, repo UserRepo, client *http.Client, r *http.Request, apiURL, apiToken string) (*models.User, error) {
+	// When behind tailscale serve, RemoteAddr is 127.0.0.1 and the real
+	// Tailscale IP is in X-Forwarded-For. Use that first to avoid a slow
+	// failed whois on loopback.
+	addr := r.RemoteAddr
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		addr = strings.TrimSpace(strings.Split(xff, ",")[0])
+	}
+	whois, err := tailscaleWhois(ctx, client, addr, apiURL, apiToken)
 	if err != nil {
-		host = remoteAddr
-	}
-
-	url := fmt.Sprintf("%s/localapi/v0/whois?addr=%s", apiURL, host)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build whois request: %w", err)
-	}
-	if apiToken != "" {
-		req.SetBasicAuth("", apiToken)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("tailscale whois: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("tailscale whois returned %d", resp.StatusCode)
-	}
-
-	var whois tailscaleWhoisResponse
-	if err := json.NewDecoder(resp.Body).Decode(&whois); err != nil {
-		return nil, fmt.Errorf("decode whois: %w", err)
+		return nil, err
 	}
 
 	if whois.UserProfile.ID == 0 {
@@ -248,7 +233,43 @@ func tailscaleAuth(ctx context.Context, repo UserRepo, client *http.Client, remo
 		u.AvatarPath = &whois.UserProfile.ProfilePicURL
 	}
 	if err := repo.Create(ctx, u); err != nil {
+		// Username taken — append a short suffix and retry.
+		if strings.Contains(err.Error(), "users_username_key") {
+			u.Username = username + "-" + newID.String()[:4]
+			if err := repo.Create(ctx, u); err != nil {
+				return nil, fmt.Errorf("create user (retry): %w", err)
+			}
+			return u, nil
+		}
 		return nil, fmt.Errorf("create user: %w", err)
 	}
 	return u, nil
+}
+
+// tailscaleWhois calls the Tailscale local API whois endpoint for the given address.
+func tailscaleWhois(ctx context.Context, client *http.Client, addr, apiURL, apiToken string) (*tailscaleWhoisResponse, error) {
+	url := fmt.Sprintf("%s/localapi/v0/whois?addr=%s", apiURL, addr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build whois request: %w", err)
+	}
+	if apiToken != "" {
+		req.SetBasicAuth("", apiToken)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("tailscale whois: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("tailscale whois returned %d for %s", resp.StatusCode, addr)
+	}
+
+	var whois tailscaleWhoisResponse
+	if err := json.NewDecoder(resp.Body).Decode(&whois); err != nil {
+		return nil, fmt.Errorf("decode whois: %w", err)
+	}
+	return &whois, nil
 }
