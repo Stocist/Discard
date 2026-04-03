@@ -10,11 +10,19 @@ services:
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
       - TS_SOCKET=/var/run/tailscale/tailscaled.sock
-      - TS_SERVE_CONFIG=/config/tailscale-serve.json
+      - TS_EXTRA_ARGS=--netfilter-mode=off
+    # tailscale serve is applied via entrypoint command below
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        /usr/local/bin/containerboot &
+        sleep 5
+        tailscale serve --bg http://127.0.0.1:4000
+        wait
     volumes:
       - tailscale-state:/var/lib/tailscale
       - tailscale-sock:/var/run/tailscale
-      - ./tailscale-serve.json:/config/tailscale-serve.json:ro
     devices:
       - /dev/net/tun:/dev/net/tun
     networks:
