@@ -3,6 +3,7 @@ package voice
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -95,6 +96,37 @@ func newMediaEngine() (*webrtc.MediaEngine, error) {
 	return m, nil
 }
 
+// gatherHostIPs returns non-loopback IPv4 addresses from all interfaces,
+// including POINTOPOINT (tailscale0) which Pion normally skips.
+func gatherHostIPs() []string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var ips []string
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip == nil {
+				continue
+			}
+			ips = append(ips, ip.String())
+		}
+	}
+	return ips
+}
+
 func newPeerConnection(me *webrtc.MediaEngine) (*webrtc.PeerConnection, error) {
 	i := &interceptor.Registry{}
 	statsFactory, err := stats.NewInterceptor()
@@ -107,8 +139,13 @@ func newPeerConnection(me *webrtc.MediaEngine) (*webrtc.PeerConnection, error) {
 	}
 
 	se := webrtc.SettingEngine{}
-	se.SetLite(true)
 	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+
+	// Include all interface IPs (including POINTOPOINT like tailscale0)
+	// so browsers can reach the server via Tailscale.
+	if ips := gatherHostIPs(); len(ips) > 0 {
+		se.SetNAT1To1IPs(ips, webrtc.ICECandidateTypeHost)
+	}
 
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(me),
@@ -268,7 +305,9 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 		s.sendToUser(userID, data)
 	})
 
-	// Connection state: evict on failed/closed, grace period on disconnected
+	// Connection state: only evict on failed/closed.
+	// Disconnected is transient (ICE consent checks, brief network blips) and
+	// recovers on its own — the sweeper catches truly dead connections.
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("voice: user %s PC state → %s", userID, state)
 		switch state {
@@ -277,22 +316,6 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 			if s.onRemove != nil {
 				s.onRemove(userID)
 			}
-		case webrtc.PeerConnectionStateDisconnected:
-			capturedP := p // capture pointer to detect rejoin
-			go func() {
-				time.Sleep(5 * time.Second)
-				s.mu.RLock()
-				currentP, ok := s.participants[userID]
-				s.mu.RUnlock()
-				// Only evict if same participant (not a rejoin) and still not connected
-				if ok && currentP == capturedP && currentP.PC.ConnectionState() != webrtc.PeerConnectionStateConnected {
-					log.Printf("voice: user %s still disconnected after grace period, removing", userID)
-					s.RemoveParticipant(userID)
-					if s.onRemove != nil {
-						s.onRemove(userID)
-					}
-				}
-			}()
 		}
 	})
 
@@ -522,6 +545,12 @@ func (s *VoiceSession) removeScreenTracksFromParticipant(viewer *participant, sh
 func (s *VoiceSession) renegotiate(userID uuid.UUID, p *participant) {
 	p.renego.Lock()
 	defer p.renego.Unlock()
+
+	// Skip if a previous offer is still pending — avoid signaling state crash.
+	if p.PC.SignalingState() != webrtc.SignalingStateStable {
+		log.Printf("voice: skipping renegotiate for %s, signaling state=%s", userID, p.PC.SignalingState())
+		return
+	}
 
 	offer, err := p.PC.CreateOffer(nil)
 	if err != nil {
