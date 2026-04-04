@@ -518,6 +518,17 @@ function startSpeakingDetection(ws: WebSocket, stream: MediaStream) {
 	}, 50);
 }
 
+async function fetchTurnCredentials(): Promise<RTCIceServer | null> {
+	try {
+		const res = await fetch('/api/turn/credentials');
+		if (!res.ok) return null;
+		const data = await res.json();
+		return { urls: data.urls, username: data.username, credential: data.credential };
+	} catch {
+		return null;
+	}
+}
+
 function stopSpeakingDetection() {
 	if (speakingInterval) {
 		clearInterval(speakingInterval);
@@ -572,9 +583,11 @@ async function handleOffer(ws: WebSocket, data: Record<string, unknown>) {
 		// Clean up any existing remote audio elements
 		document.querySelectorAll('audio[data-voice-remote]').forEach(el => el.remove());
 
-		pc = new RTCPeerConnection({
-			iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-		});
+		const iceServers: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+		const turnCreds = await fetchTurnCredentials();
+		if (turnCreds) iceServers.push(turnCreds);
+
+		pc = new RTCPeerConnection({ iceServers });
 
 		pc.onicecandidate = (event) => {
 			if (event.candidate && currentChannelId) {
