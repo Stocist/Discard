@@ -11,6 +11,7 @@ import (
 	"github.com/Stocist/discard/internal/database"
 	"github.com/Stocist/discard/internal/frontend"
 	"github.com/Stocist/discard/internal/server"
+	discardTurn "github.com/Stocist/discard/internal/turn"
 	"github.com/Stocist/discard/internal/voice"
 	"github.com/Stocist/discard/internal/websocket"
 )
@@ -51,7 +52,15 @@ func main() {
 	voiceMgr.StartSweeper()
 	voiceAdapter := voice.NewAdapter(voiceMgr)
 
-	srv := server.NewServer(db, hub, voiceAdapter)
+	turnServer, err := discardTurn.Start("discard")
+	if err != nil {
+		log.Fatalf("failed to start TURN server: %v", err)
+	}
+	defer turnServer.Close()
+
+	turnSecret := os.Getenv("TURN_SECRET")
+
+	srv := server.NewServer(db, hub, voiceAdapter, turnSecret)
 	srv.SetupRoutes()
 
 	// Serve embedded frontend with SPA fallback

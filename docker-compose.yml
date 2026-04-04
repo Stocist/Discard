@@ -36,6 +36,7 @@ services:
       - DATABASE_URL=postgres://discard:discard@postgres:5432/discard?sslmode=disable
       - UPLOAD_DIR=/data/uploads
       - TAILSCALE_SOCK=/var/run/tailscale/tailscaled.sock
+      - TURN_SECRET=${TURN_SECRET:-discard-turn-secret}
     volumes:
       - uploads:/data/uploads
       - tailscale-sock:/var/run/tailscale:ro

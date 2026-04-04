@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/Stocist/discard/internal/auth"
 	"github.com/Stocist/discard/internal/database"
 	"github.com/Stocist/discard/internal/models"
+	discardTurn "github.com/Stocist/discard/internal/turn"
 	ws "github.com/Stocist/discard/internal/websocket"
 )
 
@@ -25,24 +28,26 @@ var upgrader = gorillaWs.Upgrader{
 }
 
 type Server struct {
-	db        *sql.DB
-	hub       *ws.Hub
-	router    *http.ServeMux
-	uploadDir string
-	voiceMgr  ws.VoiceHandler
+	db         *sql.DB
+	hub        *ws.Hub
+	router     *http.ServeMux
+	uploadDir  string
+	voiceMgr   ws.VoiceHandler
+	turnSecret string
 }
 
-func NewServer(db *sql.DB, hub *ws.Hub, voiceMgr ws.VoiceHandler) *Server {
+func NewServer(db *sql.DB, hub *ws.Hub, voiceMgr ws.VoiceHandler, turnSecret string) *Server {
 	uploadDir := os.Getenv("UPLOAD_DIR")
 	if uploadDir == "" {
 		uploadDir = "./uploads"
 	}
 	return &Server{
-		db:        db,
-		hub:       hub,
-		router:    http.NewServeMux(),
-		uploadDir: uploadDir,
-		voiceMgr:  voiceMgr,
+		db:         db,
+		hub:        hub,
+		router:     http.NewServeMux(),
+		uploadDir:  uploadDir,
+		voiceMgr:   voiceMgr,
+		turnSecret: turnSecret,
 	}
 }
 
@@ -106,6 +111,9 @@ func (s *Server) SetupRoutes() {
 
 	// Uploads — static file server
 	s.router.Handle("GET /uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(s.uploadDir))))
+
+	// TURN
+	a("GET /api/turn/credentials", s.handleTurnCredentials)
 
 	// Presence
 	a("GET /api/presence", s.handlePresence)
@@ -212,4 +220,27 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.hub.Register(client)
 	go client.WritePump()
 	go client.ReadPump()
+}
+
+func (s *Server) handleTurnCredentials(w http.ResponseWriter, r *http.Request) {
+	host := r.Header.Get("X-Forwarded-Host")
+	if host == "" {
+		host = r.Host
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
+	username, credential, ttl := discardTurn.GenerateCredentials(s.turnSecret)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"urls": []string{
+			fmt.Sprintf("turn:%s:3478?transport=udp", host),
+			fmt.Sprintf("turn:%s:3478?transport=tcp", host),
+		},
+		"username":   username,
+		"credential": credential,
+		"ttl":        ttl,
+	})
 }
