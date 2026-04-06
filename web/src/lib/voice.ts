@@ -252,13 +252,9 @@ export async function startCamera(ws: WebSocket): Promise<void> {
 			audio: false
 		});
 
-		// Add camera video track to the existing PeerConnection with a "camera-" stream ID
-		for (const track of cameraStream.getTracks()) {
-			const cameraMediaStream = new MediaStream([track]);
-			// Override stream ID by creating a custom one — use addTrack with custom stream
-			pc.addTrack(track, cameraMediaStream);
-		}
-
+		// Don't addTrack here — the server creates the recv transceiver and
+		// renegotiates. The camera track is attached in handleOffer's
+		// renegotiation path when the new sendonly video transceiver arrives.
 		cameraOn = true;
 		wsSend(ws, { type: 'voice_camera_start', channel_id: currentChannelId });
 		notify();
@@ -277,10 +273,12 @@ export function stopCamera(ws: WebSocket): void {
 
 	if (cameraStream) {
 		if (pc) {
+			// Detach camera track from sender without removing the transceiver.
+			// The server's StopCamera renegotiation handles transceiver cleanup.
 			for (const track of cameraStream.getTracks()) {
 				const sender = pc.getSenders().find(s => s.track === track);
 				if (sender) {
-					pc.removeTrack(sender);
+					sender.replaceTrack(null);
 				}
 			}
 		}
@@ -550,7 +548,7 @@ async function handleOffer(ws: WebSocket, data: Record<string, unknown>) {
 			// Renegotiation: reuse existing PC — just update SDP and answer
 			await pc!.setRemoteDescription(new RTCSessionDescription(data.sdp as RTCSessionDescriptionInit));
 
-			// Reattach local track to any new empty sendonly transceiver (added for new participants)
+			// Reattach local audio track to any new empty sendonly transceiver
 			if (localStream) {
 				const audioTrack = localStream.getAudioTracks()[0];
 				if (audioTrack) {
@@ -559,6 +557,19 @@ async function handleOffer(ws: WebSocket, data: Record<string, unknown>) {
 					);
 					if (emptySender) {
 						await emptySender.sender.replaceTrack(audioTrack);
+					}
+				}
+			}
+
+			// Attach camera track if camera is on and server added a recv transceiver
+			if (cameraOn && cameraStream) {
+				const videoTrack = cameraStream.getVideoTracks()[0];
+				if (videoTrack) {
+					const emptyVideoSender = pc!.getTransceivers().find(
+						t => t.direction === 'sendonly' && t.sender.track === null
+					);
+					if (emptyVideoSender) {
+						await emptyVideoSender.sender.replaceTrack(videoTrack);
 					}
 				}
 			}

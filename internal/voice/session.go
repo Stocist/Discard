@@ -11,6 +11,7 @@ import (
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/stats"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -44,8 +45,9 @@ type participant struct {
 	// Recv transceivers added when this user starts screen sharing (cleaned up on stop)
 	screenRecvTransceivers []*webrtc.RTPTransceiver
 	// Recv transceiver added when this user starts camera (cleaned up on stop)
-	cameraRecvTransceiver *webrtc.RTPTransceiver
-	renego                sync.Mutex // serializes renegotiation per participant
+	cameraRecvTransceiver  *webrtc.RTPTransceiver
+	renego                 sync.Mutex // serializes renegotiation per participant
+	needsRenegotiation     bool       // set when renegotiation was deferred
 }
 
 // VoiceSession manages a single voice channel's WebRTC connections.
@@ -433,6 +435,7 @@ func (s *VoiceSession) forwardTrack(sourceUserID uuid.UUID, remote *webrtc.Track
 }
 
 // HandleAnswer sets the remote SDP answer on a participant's PeerConnection.
+// If a renegotiation was deferred while this answer was pending, it retries.
 func (s *VoiceSession) HandleAnswer(userID uuid.UUID, sdpRaw json.RawMessage) error {
 	s.mu.RLock()
 	p, ok := s.participants[userID]
@@ -447,7 +450,16 @@ func (s *VoiceSession) HandleAnswer(userID uuid.UUID, sdpRaw json.RawMessage) er
 		return err
 	}
 	log.Printf("voice: HandleAnswer for %s, SDP type=%s, len=%d", userID, answer.Type, len(answer.SDP))
-	return p.PC.SetRemoteDescription(answer)
+	if err := p.PC.SetRemoteDescription(answer); err != nil {
+		return err
+	}
+
+	// If renegotiation was deferred, retry now that signaling is stable.
+	if p.needsRenegotiation {
+		p.needsRenegotiation = false
+		go s.renegotiate(userID, p)
+	}
+	return nil
 }
 
 // HandleICE adds an ICE candidate to a participant's PeerConnection.
@@ -546,9 +558,10 @@ func (s *VoiceSession) renegotiate(userID uuid.UUID, p *participant) {
 	p.renego.Lock()
 	defer p.renego.Unlock()
 
-	// Skip if a previous offer is still pending — avoid signaling state crash.
+	// If a previous offer is still pending, defer — HandleAnswer will retry.
 	if p.PC.SignalingState() != webrtc.SignalingStateStable {
-		log.Printf("voice: skipping renegotiate for %s, signaling state=%s", userID, p.PC.SignalingState())
+		p.needsRenegotiation = true
+		log.Printf("voice: deferring renegotiate for %s, signaling state=%s", userID, p.PC.SignalingState())
 		return
 	}
 
@@ -924,6 +937,15 @@ func (s *VoiceSession) removeCameraTracksFromParticipant(viewer *participant, ca
 	}
 }
 
+// requestKeyframe sends an RTCP PLI to the sender so the encoder generates a keyframe.
+func requestKeyframe(pc *webrtc.PeerConnection, remote *webrtc.TrackRemote) {
+	if err := pc.WriteRTCP([]rtcp.Packet{
+		&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())},
+	}); err != nil {
+		log.Printf("voice: PLI send error: %v", err)
+	}
+}
+
 // forwardCameraTrack reads RTP from a camera video remote track and writes
 // to all other participants' camera output tracks.
 func (s *VoiceSession) forwardCameraTrack(sourceUserID uuid.UUID, remote *webrtc.TrackRemote) {
@@ -937,6 +959,9 @@ func (s *VoiceSession) forwardCameraTrack(sourceUserID uuid.UUID, remote *webrtc
 		return
 	}
 	srcPC := p.PC
+
+	// Request an immediate keyframe so viewers can start decoding
+	requestKeyframe(srcPC, remote)
 
 	for {
 		state := srcPC.ConnectionState()
@@ -994,6 +1019,11 @@ func (s *VoiceSession) forwardScreenTrack(sourceUserID uuid.UUID, remote *webrtc
 		return
 	}
 	srcPC := p.PC
+
+	// Request an immediate keyframe for video so viewers can start decoding
+	if isVideo {
+		requestKeyframe(srcPC, remote)
+	}
 
 	for {
 		state := srcPC.ConnectionState()
