@@ -14,10 +14,15 @@ import (
 )
 
 const (
-	writeWait      = 10 * time.Second
-	pongWait       = 60 * time.Second
-	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 4096
+	writeWait  = 10 * time.Second
+	pongWait   = 60 * time.Second
+	pingPeriod = (pongWait * 9) / 10
+	// WebRTC offer/answer SDPs carry one m-line per pre-allocated transceiver
+	// per participant, so signaling messages grow well past a few KB with
+	// multiple users (an 8-m-line answer is ~5-6 KB). Gorilla closes the
+	// connection if an inbound message exceeds this, so it must comfortably
+	// fit the largest SDP for a full voice channel.
+	maxMessageSize = 1 << 20 // 1 MiB
 	sendBufSize    = 256
 )
 
@@ -29,10 +34,10 @@ type MembershipChecker func(ctx context.Context, userID uuid.UUID, channelID uui
 
 // Client is a middleman between a WebSocket connection and the Hub.
 type Client struct {
-	hub      *Hub
-	conn     *websocket.Conn
-	send     chan []byte
-	closeSend sync.Once
+	hub        *Hub
+	conn       *websocket.Conn
+	send       chan []byte
+	closeSend  sync.Once
 	UserID     uuid.UUID
 	Username   string
 	AvatarPath string
@@ -67,7 +72,7 @@ func NewClient(conn *websocket.Conn, userID uuid.UUID, handler MessageHandler, c
 
 // VoiceHandler handles voice signaling without importing the voice package.
 type VoiceHandler interface {
-	Join(channelID, userID uuid.UUID, username, avatarPath string) (json.RawMessage, error)
+	Join(channelID, userID uuid.UUID, username, avatarPath string) (sdp json.RawMessage, transceiverMIDs map[string]string, err error)
 	Leave(channelID, userID uuid.UUID)
 	HandleAnswer(channelID, userID uuid.UUID, sdp json.RawMessage) error
 	HandleICE(channelID, userID uuid.UUID, candidate json.RawMessage) error
@@ -114,9 +119,12 @@ type outgoingMessage struct {
 // Must be called in its own goroutine — one per connection.
 func (c *Client) ReadPump() {
 	defer func() {
-		if c.OnVoice != nil && !c.hub.HasOtherConnections(c.UserID, c) {
-			c.OnVoice.DisconnectUser(c.UserID)
-		}
+		// Voice cleanup is NOT done here. It's handled by:
+		// 1. Manager.Join → DisconnectUser (cleans stale sessions before new join)
+		// 2. OnConnectionStateChange → RemoveParticipant (handles failed PCs)
+		// 3. Sweeper (catches dead connections every 30s)
+		// Calling DisconnectUser here races with async hub registration and
+		// kills voice sessions that a replacement WS connection just created.
 		c.hub.UnsubscribeAll(c)
 		c.conn.Close()
 	}()
@@ -278,17 +286,21 @@ func (c *Client) handleVoiceJoin(msg incomingMessage) {
 		c.sendError("invalid channel_id")
 		return
 	}
-	sdp, err := c.OnVoice.Join(channelID, c.UserID, c.Username, c.AvatarPath)
+	sdp, mids, err := c.OnVoice.Join(channelID, c.UserID, c.Username, c.AvatarPath)
 	if err != nil {
 		log.Printf("voice join error: %v", err)
 		c.sendError("failed to join voice channel")
 		return
 	}
-	data, _ := json.Marshal(map[string]interface{}{
+	out := map[string]interface{}{
 		"type":       "voice_offer",
 		"channel_id": channelID.String(),
 		"sdp":        json.RawMessage(sdp),
-	})
+	}
+	if mids != nil {
+		out["transceiver_mids"] = mids
+	}
+	data, _ := json.Marshal(out)
 	c.hub.SendToClient(c, data)
 }
 

@@ -200,13 +200,19 @@ func (h *Hub) HasOtherConnections(userID uuid.UUID, exclude *Client) bool {
 func (h *Hub) SendToUser(userID uuid.UUID, data []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	sent := 0
 	for client := range h.allClients {
 		if client.UserID == userID {
 			select {
 			case client.send <- data:
+				sent++
 			default:
+				log.Printf("ws: SendToUser %s: send buffer full, dropped message", userID)
 			}
 		}
+	}
+	if sent != 1 {
+		log.Printf("ws: SendToUser %s: sent to %d connections (expected 1)", userID, sent)
 	}
 }
 

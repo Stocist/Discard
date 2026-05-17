@@ -43,15 +43,17 @@
 			});
 		}
 
-		// Remote cameras
+		// Remote cameras — only show if participant has camera_on
 		for (const [userId, stream] of remoteCameras) {
 			const p = participants.find(pp => pp.user_id === userId);
-			entries.push({
-				userId,
-				username: p?.username ?? 'Unknown',
-				stream,
-				isLocal: false
-			});
+			if (p?.camera_on) {
+				entries.push({
+					userId,
+					username: p?.username ?? 'Unknown',
+					stream,
+					isLocal: false
+				});
+			}
 		}
 
 		return entries;

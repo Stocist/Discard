@@ -96,8 +96,9 @@ func (m *Manager) sweepStale() {
 }
 
 // Join adds a user to a voice channel, creating the session if needed.
-// Returns an SDP offer as JSON to send to the client.
-func (m *Manager) Join(channelID, userID uuid.UUID, username, avatarPath string) (json.RawMessage, error) {
+// Returns the SDP offer and transceiver MIDs to send to the client.
+func (m *Manager) Join(channelID, userID uuid.UUID, username, avatarPath string) (json.RawMessage, map[string]string, error) {
+	log.Printf("voice: Manager.Join called for %s (%s) in channel %s", userID, username, channelID)
 	// Disconnect user from any other voice channel first
 	m.DisconnectUser(userID)
 
@@ -118,13 +119,13 @@ func (m *Manager) Join(channelID, userID uuid.UUID, username, avatarPath string)
 	}
 	m.mu.Unlock()
 
-	sdp, err := session.AddParticipant(userID, username, avatarPath)
+	result, err := session.AddParticipant(userID, username, avatarPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	m.broadcastVoiceState(channelID)
-	return sdp, nil
+	return result.SDP, result.TransceiverMIDs, nil
 }
 
 // Leave removes a user from a voice channel.
@@ -197,6 +198,7 @@ func (m *Manager) SetDeafened(channelID, userID uuid.UUID, deafened bool) {
 
 // DisconnectUser removes a user from all voice sessions (called on WS disconnect).
 func (m *Manager) DisconnectUser(userID uuid.UUID) {
+	log.Printf("voice: DisconnectUser called for %s", userID)
 	m.mu.RLock()
 	sessions := make(map[uuid.UUID]*VoiceSession, len(m.sessions))
 	for id, s := range m.sessions {

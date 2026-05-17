@@ -39,6 +39,12 @@ let cameraOn = false;
 let cameraParticipants: Map<string, MediaStream> = new Map(); // remote camera streams keyed by user ID
 let cameraListeners = new Set<() => void>();
 
+// Pre-allocated transceiver MIDs (set from initial voice_offer, stable for PC lifetime)
+let micMid: string | null = null;
+let cameraMid: string | null = null;
+let screenVideoMid: string | null = null;
+let screenAudioMid: string | null = null;
+
 // Error state — surfaced to UI
 let lastError: string | null = null;
 let errorListeners = new Set<(msg: string | null) => void>();
@@ -125,6 +131,10 @@ export function leaveVoice(ws: WebSocket): void {
 	screenSharerUsername = null;
 	screenShareChannelId = null;
 	cameraParticipants.clear();
+	micMid = null;
+	cameraMid = null;
+	screenVideoMid = null;
+	screenAudioMid = null;
 	currentChannelId = null;
 	muted = false;
 	deafened = false;
@@ -252,9 +262,15 @@ export async function startCamera(ws: WebSocket): Promise<void> {
 			audio: false
 		});
 
-		// Don't addTrack here — the server creates the recv transceiver and
-		// renegotiates. The camera track is attached in handleOffer's
-		// renegotiation path when the new sendonly video transceiver arrives.
+		// Attach camera track to pre-allocated transceiver via replaceTrack (no renegotiation)
+		const videoTrack = cameraStream.getVideoTracks()[0];
+		if (videoTrack && cameraMid) {
+			const tr = pc.getTransceivers().find(t => t.mid === cameraMid);
+			if (tr) {
+				await tr.sender.replaceTrack(videoTrack);
+			}
+		}
+
 		cameraOn = true;
 		wsSend(ws, { type: 'voice_camera_start', channel_id: currentChannelId });
 		notify();
@@ -271,17 +287,15 @@ export async function startCamera(ws: WebSocket): Promise<void> {
 export function stopCamera(ws: WebSocket): void {
 	if (!cameraOn) return;
 
-	if (cameraStream) {
-		if (pc) {
-			// Detach camera track from sender without removing the transceiver.
-			// The server's StopCamera renegotiation handles transceiver cleanup.
-			for (const track of cameraStream.getTracks()) {
-				const sender = pc.getSenders().find(s => s.track === track);
-				if (sender) {
-					sender.replaceTrack(null);
-				}
-			}
+	// Detach camera track from pre-allocated transceiver (no renegotiation)
+	if (pc && cameraMid) {
+		const tr = pc.getTransceivers().find(t => t.mid === cameraMid);
+		if (tr) {
+			tr.sender.replaceTrack(null);
 		}
+	}
+
+	if (cameraStream) {
 		cameraStream.getTracks().forEach(t => t.stop());
 		cameraStream = null;
 	}
@@ -320,9 +334,20 @@ export async function startScreenShare(ws: WebSocket, resolution?: string): Prom
 			audio: true
 		});
 
-		// Add screen share tracks to the existing PeerConnection
-		for (const track of screenStream.getTracks()) {
-			pc.addTrack(track, screenStream);
+		// Attach screen tracks to pre-allocated transceivers via replaceTrack (no renegotiation)
+		const videoTrack = screenStream.getVideoTracks()[0];
+		if (videoTrack && screenVideoMid) {
+			const tr = pc.getTransceivers().find(t => t.mid === screenVideoMid);
+			if (tr) {
+				await tr.sender.replaceTrack(videoTrack);
+			}
+		}
+		const audioTrack = screenStream.getAudioTracks()[0];
+		if (audioTrack && screenAudioMid) {
+			const tr = pc.getTransceivers().find(t => t.mid === screenAudioMid);
+			if (tr) {
+				await tr.sender.replaceTrack(audioTrack);
+			}
 		}
 
 		// Listen for user stopping share via browser UI
@@ -343,12 +368,12 @@ export async function startScreenShare(ws: WebSocket, resolution?: string): Prom
 					const newTrack = newStream.getAudioTracks()[0];
 					if (newTrack) {
 						newTrack.enabled = !muted;
-						// Find the sender that was carrying our voice audio and replace its track
-						const voiceSender = pc.getSenders().find(s =>
-							s.track === null || s.track === micTrack
-						);
-						if (voiceSender) {
-							await voiceSender.replaceTrack(newTrack);
+						// Re-attach mic to its pre-allocated transceiver
+						if (micMid) {
+							const micTr = pc.getTransceivers().find(t => t.mid === micMid);
+							if (micTr) {
+								await micTr.sender.replaceTrack(newTrack);
+							}
 						}
 					}
 				} catch (_) { /* mic re-acquire failed, voice will be muted */ }
@@ -372,16 +397,19 @@ export async function startScreenShare(ws: WebSocket, resolution?: string): Prom
 export function stopScreenShare(ws: WebSocket): void {
 	if (!screenSharing) return;
 
-	if (screenStream) {
-		// Remove screen share tracks from PeerConnection
-		if (pc) {
-			for (const track of screenStream.getTracks()) {
-				const sender = pc.getSenders().find(s => s.track === track);
-				if (sender) {
-					pc.removeTrack(sender);
-				}
-			}
+	// Detach screen tracks from pre-allocated transceivers (no renegotiation)
+	if (pc) {
+		if (screenVideoMid) {
+			const tr = pc.getTransceivers().find(t => t.mid === screenVideoMid);
+			if (tr) tr.sender.replaceTrack(null);
 		}
+		if (screenAudioMid) {
+			const tr = pc.getTransceivers().find(t => t.mid === screenAudioMid);
+			if (tr) tr.sender.replaceTrack(null);
+		}
+	}
+
+	if (screenStream) {
 		screenStream.getTracks().forEach(t => t.stop());
 		screenStream = null;
 	}
@@ -545,44 +573,20 @@ async function handleOffer(ws: WebSocket, data: Record<string, unknown>) {
 		console.log('[voice] handleOffer:', isRenegotiation ? 'renegotiation' : 'initial', 'pc state:', pc?.connectionState ?? 'null');
 
 		if (isRenegotiation) {
-			// Renegotiation: reuse existing PC — just update SDP and answer
-			await pc!.setRemoteDescription(new RTCSessionDescription(data.sdp as RTCSessionDescriptionInit));
-
-			// Reattach local audio track to any new empty sendonly transceiver
-			if (localStream) {
-				const audioTrack = localStream.getAudioTracks()[0];
-				if (audioTrack) {
-					const emptySender = pc!.getTransceivers().find(
-						t => t.direction === 'sendonly' && t.sender.track === null
-					);
-					if (emptySender) {
-						await emptySender.sender.replaceTrack(audioTrack);
-					}
-				}
+			// Renegotiation: reuse existing PC — just update SDP and answer.
+			// Camera/screen tracks are managed purely by startCamera/startScreenShare via replaceTrack.
+			try {
+				console.log('[voice] renegotiation: setting remote description, signalingState=', pc!.signalingState);
+				await pc!.setRemoteDescription(new RTCSessionDescription(data.sdp as RTCSessionDescriptionInit));
+				console.log('[voice] renegotiation: creating answer');
+				const answer = await pc!.createAnswer();
+				console.log('[voice] renegotiation: setting local description');
+				await pc!.setLocalDescription(answer);
+				wsSend(ws, { type: 'voice_answer', channel_id: currentChannelId, sdp: answer });
+				console.log('[voice] renegotiation answer sent, SDP len=', answer.sdp?.length);
+			} catch (reErr) {
+				console.error('[voice] renegotiation FAILED:', reErr);
 			}
-
-			// Attach camera track if camera is on and server added a recv transceiver
-			if (cameraOn && cameraStream) {
-				const videoTrack = cameraStream.getVideoTracks()[0];
-				if (videoTrack) {
-					const emptyVideoSender = pc!.getTransceivers().find(
-						t => t.direction === 'sendonly' && t.sender.track === null
-					);
-					if (emptyVideoSender) {
-						await emptyVideoSender.sender.replaceTrack(videoTrack);
-					}
-				}
-			}
-
-			const answer = await pc!.createAnswer();
-			await pc!.setLocalDescription(answer);
-
-			wsSend(ws, {
-				type: 'voice_answer',
-				channel_id: currentChannelId,
-				sdp: answer
-			});
-			console.log('[voice] renegotiation answer sent');
 			return;
 		}
 
@@ -700,6 +704,30 @@ async function handleOffer(ws: WebSocket, data: Record<string, unknown>) {
 		// Set remote description first so transceivers are created from the offer
 		await pc.setRemoteDescription(new RTCSessionDescription(data.sdp as RTCSessionDescriptionInit));
 
+		// Parse pre-allocated transceiver MIDs from initial offer
+		const mids = data.transceiver_mids as Record<string, string> | undefined;
+		if (mids) {
+			micMid = mids.mic_audio ?? null;
+			cameraMid = mids.camera_video ?? null;
+			screenVideoMid = mids.screen_video ?? null;
+			screenAudioMid = mids.screen_audio ?? null;
+		}
+
+		// The server pre-allocates these as recvonly (it receives our mic /
+		// camera / screen). A transceiver the browser created from a recvonly
+		// remote offer defaults to a non-sending direction, and replaceTrack()
+		// does NOT change direction — so without this the answer negotiates
+		// these m-lines as non-sending and the browser transmits nothing (the
+		// server never sees the track and OnTrack never fires). Pre-negotiate
+		// all four as sendonly here, before createAnswer, so the mic flows
+		// immediately and camera/screen can later attach via replaceTrack with
+		// zero renegotiation.
+		for (const mid of [micMid, cameraMid, screenVideoMid, screenAudioMid]) {
+			if (!mid) continue;
+			const tr = pc.getTransceivers().find((t) => t.mid === mid);
+			if (tr) tr.direction = 'sendonly';
+		}
+
 		// Get local audio
 		localStream = await navigator.mediaDevices.getUserMedia({
 			audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
@@ -707,13 +735,10 @@ async function handleOffer(ws: WebSocket, data: Record<string, unknown>) {
 		const audioTrack = localStream.getAudioTracks()[0];
 		if (audioTrack) {
 			audioTrack.enabled = !muted;
-			// Find the transceiver for sending our mic audio.
-			// After setRemoteDescription with a recvonly offer, the local direction is sendonly.
-			const sendTransceiver = pc.getTransceivers().find(
-				t => t.direction === 'sendonly' && t.sender.track === null
-			);
-			if (sendTransceiver) {
-				await sendTransceiver.sender.replaceTrack(audioTrack);
+			// Attach mic to pre-allocated transceiver by MID
+			const micTr = micMid ? pc.getTransceivers().find(t => t.mid === micMid) : null;
+			if (micTr) {
+				await micTr.sender.replaceTrack(audioTrack);
 			} else {
 				pc.addTrack(audioTrack, localStream);
 			}

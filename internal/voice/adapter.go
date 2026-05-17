@@ -18,7 +18,7 @@ func NewAdapter(mgr *Manager) *Adapter {
 	return &Adapter{mgr: mgr}
 }
 
-func (a *Adapter) Join(channelID, userID uuid.UUID, username, avatarPath string) (json.RawMessage, error) {
+func (a *Adapter) Join(channelID, userID uuid.UUID, username, avatarPath string) (json.RawMessage, map[string]string, error) {
 	return a.mgr.Join(channelID, userID, username, avatarPath)
 }
 

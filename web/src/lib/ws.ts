@@ -107,11 +107,13 @@ export function createWSConnection(opts?: { handleVoice?: boolean }): WebSocket 
 	});
 
 	ws.addEventListener('close', () => {
-		if (handleVoice) cleanupVoiceOnDisconnect();
+		// Don't cleanup voice on WS close — the WebRTC PeerConnection is independent
+		// and survives WS reconnects. Voice is cleaned up by leaveVoice() or PC failure.
+		// cleanupVoiceOnDisconnect is only called on permanent disconnects (page unload).
 	});
 
 	ws.addEventListener('error', () => {
-		if (handleVoice) cleanupVoiceOnDisconnect();
+		// Same as close — don't kill voice on transient WS errors.
 	});
 
 	ws.addEventListener('message', (event) => {

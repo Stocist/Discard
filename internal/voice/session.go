@@ -26,6 +26,12 @@ type ParticipantState struct {
 	CameraOn      bool      `json:"camera_on"`
 }
 
+// JoinResult is returned from AddParticipant with the SDP offer and transceiver MIDs.
+type JoinResult struct {
+	SDP             json.RawMessage
+	TransceiverMIDs map[string]string // mic_audio, camera_video, screen_video, screen_audio → MID strings
+}
+
 // participant is the internal state for one user in a voice session.
 type participant struct {
 	UserID        uuid.UUID
@@ -42,12 +48,14 @@ type participant struct {
 	screenAudioTracks map[uuid.UUID]*webrtc.TrackLocalStaticRTP
 	// Camera output tracks forwarded to this participant from other users
 	cameraVideoTracks map[uuid.UUID]*webrtc.TrackLocalStaticRTP
-	// Recv transceivers added when this user starts screen sharing (cleaned up on stop)
-	screenRecvTransceivers []*webrtc.RTPTransceiver
-	// Recv transceiver added when this user starts camera (cleaned up on stop)
-	cameraRecvTransceiver  *webrtc.RTPTransceiver
-	renego                 sync.Mutex // serializes renegotiation per participant
-	needsRenegotiation     bool       // set when renegotiation was deferred
+	// Pre-allocated recv transceivers (created at join, never removed)
+	audioRecvTransceiver       *webrtc.RTPTransceiver
+	cameraRecvTransceiver      *webrtc.RTPTransceiver
+	screenVideoRecvTransceiver *webrtc.RTPTransceiver
+	screenAudioRecvTransceiver *webrtc.RTPTransceiver
+	renego                     sync.Mutex // serializes renegotiation per participant
+	needsRenegotiation         bool       // set when renegotiation was deferred
+	pendingNewUser             uuid.UUID  // user whose tracks need adding on deferred renego
 }
 
 // VoiceSession manages a single voice channel's WebRTC connections.
@@ -157,9 +165,10 @@ func newPeerConnection(me *webrtc.MediaEngine) (*webrtc.PeerConnection, error) {
 	return api.NewPeerConnection(webrtc.Configuration{})
 }
 
-// AddParticipant creates a PeerConnection for the user, sets up track forwarding,
-// and returns an SDP offer to send to the client.
-func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath string) (json.RawMessage, error) {
+// AddParticipant creates a PeerConnection for the user, pre-allocates all 4 recv
+// transceivers (mic, camera, screen video, screen audio), sets up track forwarding,
+// and returns a JoinResult with the SDP offer and transceiver MIDs.
+func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath string) (*JoinResult, error) {
 	s.mu.Lock()
 
 	// If already present, remove first
@@ -189,8 +198,9 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 		cameraVideoTracks: make(map[uuid.UUID]*webrtc.TrackLocalStaticRTP),
 	}
 
-	// Add a recv-only transceiver so the client sends us their audio
-	_, err = pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+	// Pre-allocate all 4 recv-only transceivers so the client can send media
+	// without renegotiation. Order: mic audio, camera video, screen video, screen audio.
+	audioRecvTr, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionRecvonly,
 	})
 	if err != nil {
@@ -198,95 +208,72 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 		s.mu.Unlock()
 		return nil, err
 	}
+	p.audioRecvTransceiver = audioRecvTr
 
-	// Create output tracks for existing participants → new participant hears them
-	for otherID, other := range s.participants {
-		track, err := webrtc.NewTrackLocalStaticRTP(
-			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
-			"audio-"+otherID.String(),
-			"voice-"+s.ChannelID.String(),
-		)
-		if err != nil {
-			pc.Close()
-			s.mu.Unlock()
-			return nil, err
-		}
-		// Use sendonly transceiver so client sees recvonly direction in offer
-		transceiver, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
-			Direction: webrtc.RTPTransceiverDirectionSendonly,
-		})
-		if err != nil {
-			pc.Close()
-			s.mu.Unlock()
-			return nil, err
-		}
-		if err := transceiver.Sender().ReplaceTrack(track); err != nil {
-			pc.Close()
-			s.mu.Unlock()
-			return nil, err
-		}
-		p.outputTracks[otherID] = track
+	cameraRecvTr, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	})
+	if err != nil {
+		pc.Close()
+		s.mu.Unlock()
+		return nil, err
+	}
+	p.cameraRecvTransceiver = cameraRecvTr
 
-		// Also create output track on other participant's PC for this new user
-		otherTrack, err := webrtc.NewTrackLocalStaticRTP(
-			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
-			"audio-"+userID.String(),
-			"voice-"+s.ChannelID.String(),
-		)
-		if err != nil {
+	screenVideoRecvTr, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	})
+	if err != nil {
+		pc.Close()
+		s.mu.Unlock()
+		return nil, err
+	}
+	p.screenVideoRecvTransceiver = screenVideoRecvTr
+
+	screenAudioRecvTr, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	})
+	if err != nil {
+		pc.Close()
+		s.mu.Unlock()
+		return nil, err
+	}
+	p.screenAudioRecvTransceiver = screenAudioRecvTr
+
+	// Create output tracks on the NEW participant's PC for each existing participant.
+	// We do NOT touch existing participants' PCs here — their output tracks for
+	// the new user are added during renegotiation (addOutputTracksForUser) to avoid
+	// corrupting their signaling state.
+	for otherID, _ := range s.participants {
+		if err := s.addOutputTracksForUser(p, otherID); err != nil {
 			pc.Close()
 			s.mu.Unlock()
 			return nil, err
 		}
-		// Use sendonly transceiver so client sees recvonly direction in offer
-		otherTransceiver, err := other.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
-			Direction: webrtc.RTPTransceiverDirectionSendonly,
-		})
-		if err != nil {
-			pc.Close()
-			s.mu.Unlock()
-			return nil, err
-		}
-		if err := otherTransceiver.Sender().ReplaceTrack(otherTrack); err != nil {
-			pc.Close()
-			s.mu.Unlock()
-			return nil, err
-		}
-		other.outputTracks[userID] = otherTrack
 	}
 
-	// OnTrack: forward incoming RTP to all other participants' output tracks
-	// Audio: first audio track = voice mic, subsequent audio = screen share system audio.
-	// Video: differentiate camera vs screen by matching the receiver against the
-	// camera recv transceiver stored on the participant. If the receiver's transceiver
-	// matches, it's camera; otherwise it's screen share.
-	voiceAudioReceived := false
+	// OnTrack: match incoming tracks to pre-allocated recv transceivers
 	pc.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		codec := remote.Codec().MimeType
 		log.Printf("voice: OnTrack fired for user %s, codec=%s, streamID=%s, kind=%s", userID, codec, remote.StreamID(), remote.Kind())
 
-		if remote.Kind() == webrtc.RTPCodecTypeVideo {
-			// Check if this receiver belongs to the camera transceiver
-			isCamera := false
-			s.mu.RLock()
-			if cp, ok := s.participants[userID]; ok && cp.cameraRecvTransceiver != nil {
-				if cp.cameraRecvTransceiver.Receiver() == receiver {
-					isCamera = true
-				}
-			}
-			s.mu.RUnlock()
-			if isCamera {
-				go s.forwardCameraTrack(userID, remote)
-			} else {
-				go s.forwardScreenTrack(userID, remote)
-			}
-		} else if remote.Kind() == webrtc.RTPCodecTypeAudio && !voiceAudioReceived {
-			// First audio track is voice
-			voiceAudioReceived = true
-			go s.forwardTrack(userID, remote)
-		} else {
-			// Subsequent audio tracks are screen share system audio
+		s.mu.RLock()
+		cp, ok := s.participants[userID]
+		s.mu.RUnlock()
+		if !ok {
+			return
+		}
+
+		switch {
+		case cp.cameraRecvTransceiver != nil && cp.cameraRecvTransceiver.Receiver() == receiver:
+			go s.forwardCameraTrack(userID, remote)
+		case cp.screenVideoRecvTransceiver != nil && cp.screenVideoRecvTransceiver.Receiver() == receiver:
 			go s.forwardScreenTrack(userID, remote)
+		case cp.screenAudioRecvTransceiver != nil && cp.screenAudioRecvTransceiver.Receiver() == receiver:
+			go s.forwardScreenTrack(userID, remote)
+		default:
+			// Default = mic audio (the first recv transceiver)
+			go s.forwardTrack(userID, remote)
 		}
 	})
 
@@ -311,10 +298,25 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 	// Disconnected is transient (ICE consent checks, brief network blips) and
 	// recovers on its own — the sweeper catches truly dead connections.
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("voice: user %s PC state → %s", userID, state)
+		log.Printf("voice: user %s PC state → %s (trigger: OnConnectionStateChange)", userID, state)
 		switch state {
-		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+		case webrtc.PeerConnectionStateConnected:
+			// If renegotiation was deferred waiting for ICE to connect, run it now
+			if p.needsRenegotiation {
+				p.needsRenegotiation = false
+				newUser := p.pendingNewUser
+				p.pendingNewUser = uuid.Nil
+				log.Printf("voice: user %s now connected, running deferred renegotiate (newUser=%s)", userID, newUser)
+				go s.renegotiate(userID, p, newUser)
+			}
+		case webrtc.PeerConnectionStateFailed:
+			log.Printf("voice: user %s PC FAILED, removing participant", userID)
 			s.RemoveParticipant(userID)
+			if s.onRemove != nil {
+				s.onRemove(userID)
+			}
+		case webrtc.PeerConnectionStateClosed:
+			log.Printf("voice: user %s PC CLOSED (already cleaned up)", userID)
 			if s.onRemove != nil {
 				s.onRemove(userID)
 			}
@@ -345,7 +347,7 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 		}
 		s.mu.Unlock()
 		for id, op := range remaining {
-			s.renegotiate(id, op)
+			s.renegotiate(id, op, uuid.Nil)
 		}
 	}
 
@@ -374,12 +376,120 @@ func (s *VoiceSession) AddParticipant(userID uuid.UUID, username, avatarPath str
 		return nil, err
 	}
 
-	// Renegotiate existing participants so they get the new output track
-	for id, op := range othersToRenegotiate {
-		s.renegotiate(id, op)
+	// Extract MIDs from the pre-allocated recv transceivers
+	mids := map[string]string{
+		"mic_audio":    audioRecvTr.Mid(),
+		"camera_video": cameraRecvTr.Mid(),
+		"screen_video": screenVideoRecvTr.Mid(),
+		"screen_audio": screenAudioRecvTr.Mid(),
 	}
 
-	return sdp, nil
+	// Renegotiate existing participants so they get the new output tracks.
+	// This is where output tracks for the new user get added to existing PCs
+	// (inside renegotiate, once their signaling state is stable).
+	//
+	// MUST run off the caller's goroutine: AddParticipant is called from the
+	// joining user's WebSocket ReadPump, which is strictly sequential per
+	// connection. renegotiate blocks on ICE gathering, so doing it inline
+	// stalls the joiner's ReadPump AND delays the joiner's own offer (sent
+	// only after Join returns) — which deadlocks the whole signaling exchange.
+	// Each renegotiate is independently serialized by p.renego, so a detached
+	// goroutine here is safe.
+	go func() {
+		for id, op := range othersToRenegotiate {
+			s.renegotiate(id, op, userID)
+		}
+	}()
+
+	return &JoinResult{SDP: sdp, TransceiverMIDs: mids}, nil
+}
+
+// addOutputTracksForUser creates 4 sendonly output tracks (audio, camera, screen video,
+// screen audio) on viewer's PC for sourceID. Caller must hold s.mu.
+func (s *VoiceSession) addOutputTracksForUser(viewer *participant, sourceID uuid.UUID) error {
+	pc := viewer.PC
+
+	// Audio
+	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		"audio-"+sourceID.String(),
+		"voice-"+s.ChannelID.String(),
+	)
+	if err != nil {
+		return err
+	}
+	tr, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	})
+	if err != nil {
+		return err
+	}
+	if err := tr.Sender().ReplaceTrack(audioTrack); err != nil {
+		return err
+	}
+	viewer.outputTracks[sourceID] = audioTrack
+
+	// Camera video
+	camTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
+		"camera-video-"+sourceID.String(),
+		"camera-"+sourceID.String(),
+	)
+	if err != nil {
+		return err
+	}
+	camTr, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	})
+	if err != nil {
+		return err
+	}
+	if err := camTr.Sender().ReplaceTrack(camTrack); err != nil {
+		return err
+	}
+	viewer.cameraVideoTracks[sourceID] = camTrack
+
+	// Screen video
+	svTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
+		"screen-video-"+sourceID.String(),
+		"screen-"+sourceID.String(),
+	)
+	if err != nil {
+		return err
+	}
+	svTr, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	})
+	if err != nil {
+		return err
+	}
+	if err := svTr.Sender().ReplaceTrack(svTrack); err != nil {
+		return err
+	}
+	viewer.screenVideoTracks[sourceID] = svTrack
+
+	// Screen audio
+	saTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		"screen-audio-"+sourceID.String(),
+		"screen-"+sourceID.String(),
+	)
+	if err != nil {
+		return err
+	}
+	saTr, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	})
+	if err != nil {
+		return err
+	}
+	if err := saTr.Sender().ReplaceTrack(saTrack); err != nil {
+		return err
+	}
+	viewer.screenAudioTracks[sourceID] = saTrack
+
+	return nil
 }
 
 // forwardTrack reads RTP packets from a remote track and writes them to all
@@ -457,7 +567,9 @@ func (s *VoiceSession) HandleAnswer(userID uuid.UUID, sdpRaw json.RawMessage) er
 	// If renegotiation was deferred, retry now that signaling is stable.
 	if p.needsRenegotiation {
 		p.needsRenegotiation = false
-		go s.renegotiate(userID, p)
+		newUser := p.pendingNewUser
+		p.pendingNewUser = uuid.Nil
+		go s.renegotiate(userID, p, newUser)
 	}
 	return nil
 }
@@ -485,8 +597,10 @@ func (s *VoiceSession) RemoveParticipant(userID uuid.UUID) {
 	p, ok := s.participants[userID]
 	if !ok {
 		s.mu.Unlock()
+		log.Printf("voice: RemoveParticipant called for %s but not found in session", userID)
 		return
 	}
+	log.Printf("voice: RemoveParticipant for %s (%s)", userID, p.Username)
 	s.removeParticipantLocked(p)
 
 	// Collect remaining participants for renegotiation
@@ -498,7 +612,7 @@ func (s *VoiceSession) RemoveParticipant(userID uuid.UUID) {
 
 	// Renegotiate remaining participants outside the lock
 	for id, other := range remaining {
-		s.renegotiate(id, other)
+		s.renegotiate(id, other, uuid.Nil)
 	}
 }
 
@@ -508,72 +622,99 @@ func (s *VoiceSession) removeParticipantLocked(p *participant) {
 	if s.screenSharerID != nil && *s.screenSharerID == p.UserID {
 		s.screenSharerID = nil
 	}
+	log.Printf("voice: removeParticipantLocked closing PC for %s (%s), PC state=%s", p.UserID, p.Username, p.PC.ConnectionState())
 	p.PC.Close()
-	// Remove output tracks and RTPSenders that other participants have for this user
+	// Remove all output tracks that other participants have for this user
 	for _, other := range s.participants {
-		if track, has := other.outputTracks[p.UserID]; has {
-			for _, sender := range other.PC.GetSenders() {
-				if sender.Track() == track {
-					other.PC.RemoveTrack(sender)
-					break
-				}
-			}
-			delete(other.outputTracks, p.UserID)
-		}
-		// Remove screen share tracks
-		s.removeScreenTracksFromParticipant(other, p.UserID)
-		// Remove camera tracks
-		s.removeCameraTracksFromParticipant(other, p.UserID)
+		removeAndCleanTrack(other, other.outputTracks, p.UserID)
+		removeAndCleanTrack(other, other.cameraVideoTracks, p.UserID)
+		removeAndCleanTrack(other, other.screenVideoTracks, p.UserID)
+		removeAndCleanTrack(other, other.screenAudioTracks, p.UserID)
 	}
 	delete(s.participants, p.UserID)
 }
 
-// removeScreenTracksFromParticipant removes screen share video/audio tracks
-// for a given sharer from a viewer's PC. Caller holds s.mu.
-func (s *VoiceSession) removeScreenTracksFromParticipant(viewer *participant, sharerID uuid.UUID) {
-	if track, has := viewer.screenVideoTracks[sharerID]; has {
+// removeAndCleanTrack removes a track for sourceID from the viewer's track map
+// and removes the corresponding RTP sender from the viewer's PeerConnection.
+func removeAndCleanTrack(viewer *participant, tracks map[uuid.UUID]*webrtc.TrackLocalStaticRTP, sourceID uuid.UUID) {
+	if track, has := tracks[sourceID]; has {
 		for _, sender := range viewer.PC.GetSenders() {
 			if sender.Track() == track {
 				viewer.PC.RemoveTrack(sender)
 				break
 			}
 		}
-		delete(viewer.screenVideoTracks, sharerID)
-	}
-	if track, has := viewer.screenAudioTracks[sharerID]; has {
-		for _, sender := range viewer.PC.GetSenders() {
-			if sender.Track() == track {
-				viewer.PC.RemoveTrack(sender)
-				break
-			}
-		}
-		delete(viewer.screenAudioTracks, sharerID)
+		delete(tracks, sourceID)
 	}
 }
 
 // renegotiate creates a new offer and sends it to the participant.
+// newUserID is the user who just joined (output tracks for them will be added
+// to this participant's PC before creating the offer). Use uuid.Nil if this
+// renegotiation is for a removal (no tracks to add).
 // Must NOT be called while holding s.mu — ICE gathering needs the lock free.
 // Uses per-participant mutex to prevent concurrent renegotiation race conditions.
-func (s *VoiceSession) renegotiate(userID uuid.UUID, p *participant) {
+func (s *VoiceSession) renegotiate(userID uuid.UUID, p *participant, newUserID uuid.UUID) {
 	p.renego.Lock()
 	defer p.renego.Unlock()
 
-	// If a previous offer is still pending, defer — HandleAnswer will retry.
+	// Defer if signaling isn't stable (pending offer/answer exchange)
 	if p.PC.SignalingState() != webrtc.SignalingStateStable {
 		p.needsRenegotiation = true
+		p.pendingNewUser = newUserID
 		log.Printf("voice: deferring renegotiate for %s, signaling state=%s", userID, p.PC.SignalingState())
 		return
 	}
 
+	// Defer if ICE hasn't finished connecting yet — a new offer would restart ICE
+	// and kill the in-progress connection attempt.
+	pcState := p.PC.ConnectionState()
+	if pcState != webrtc.PeerConnectionStateConnected {
+		p.needsRenegotiation = true
+		p.pendingNewUser = newUserID
+		log.Printf("voice: deferring renegotiate for %s, PC state=%s (waiting for connected)", userID, pcState)
+		return
+	}
+
+	log.Printf("voice: renegotiate START for %s, PC state=%s, signaling=%s, newUser=%s", userID, p.PC.ConnectionState(), p.PC.SignalingState(), newUserID)
+
+	// Add output tracks for the new user on this participant's PC
+	// (we couldn't do this during AddParticipant because the PC wasn't in stable state)
+	if newUserID != uuid.Nil {
+		if _, already := p.outputTracks[newUserID]; !already {
+			s.mu.Lock()
+			err := s.addOutputTracksForUser(p, newUserID)
+			s.mu.Unlock()
+			if err != nil {
+				log.Printf("voice: renegotiate add tracks error for %s: %v", userID, err)
+				return
+			}
+			log.Printf("voice: renegotiate added output tracks for %s on %s's PC", newUserID, userID)
+		}
+	}
+
+	log.Printf("voice: renegotiate creating offer for %s, PC state=%s, senders=%d, receivers=%d",
+		userID, p.PC.ConnectionState(), len(p.PC.GetSenders()), len(p.PC.GetReceivers()))
+
+	// Log current vs new transceiver count
+	transceivers := p.PC.GetTransceivers()
+	log.Printf("voice: renegotiate %s has %d transceivers before offer", userID, len(transceivers))
+	for i, t := range transceivers {
+		log.Printf("voice:   transceiver[%d] mid=%s dir=%s kind=%s", i, t.Mid(), t.Direction(), t.Kind())
+	}
+
 	offer, err := p.PC.CreateOffer(nil)
 	if err != nil {
-		log.Printf("voice: renegotiate offer error for %s: %v", userID, err)
+		log.Printf("voice: renegotiate CreateOffer error for %s: %v", userID, err)
 		return
 	}
+	log.Printf("voice: renegotiate CreateOffer OK for %s, SDP len=%d, PC state=%s", userID, len(offer.SDP), p.PC.ConnectionState())
+
 	if err := p.PC.SetLocalDescription(offer); err != nil {
-		log.Printf("voice: renegotiate set local desc error for %s: %v", userID, err)
+		log.Printf("voice: renegotiate SetLocalDescription error for %s: %v", userID, err)
 		return
 	}
+	log.Printf("voice: renegotiate SetLocalDescription OK for %s, PC state=%s", userID, p.PC.ConnectionState())
 
 	// Wait for ICE gathering (outside any lock)
 	gatherComplete := webrtc.GatheringCompletePromise(p.PC)
@@ -651,290 +792,70 @@ func (s *VoiceSession) ScreenSharerID() *uuid.UUID {
 	return s.screenSharerID
 }
 
-// StartScreenShare marks a user as screen sharing and sets up receive transceivers
-// for the screen video+audio, plus output tracks to all other participants.
+// StartScreenShare marks a user as screen sharing. Transceivers are pre-allocated,
+// so no renegotiation is needed — the client just calls replaceTrack.
 // Returns true if successful, false if someone else is already sharing.
 func (s *VoiceSession) StartScreenShare(userID uuid.UUID) bool {
 	s.mu.Lock()
-
-	// Only one screen share at a time
+	defer s.mu.Unlock()
 	if s.screenSharerID != nil && *s.screenSharerID != userID {
-		s.mu.Unlock()
 		return false
 	}
-
 	p, ok := s.participants[userID]
 	if !ok {
-		s.mu.Unlock()
 		return false
 	}
-
 	id := userID
 	s.screenSharerID = &id
 	p.ScreenSharing = true
-
-	// Add recv-only transceivers for screen video and screen audio
-	videoTr, err := p.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionRecvonly,
-	})
-	if err != nil {
-		log.Printf("voice: screen share add video transceiver error: %v", err)
-		s.screenSharerID = nil
-		p.ScreenSharing = false
-		s.mu.Unlock()
-		return false
-	}
-	audioTr, err := p.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionRecvonly,
-	})
-	if err != nil {
-		log.Printf("voice: screen share add audio transceiver error: %v", err)
-		s.screenSharerID = nil
-		p.ScreenSharing = false
-		s.mu.Unlock()
-		return false
-	}
-	p.screenRecvTransceivers = []*webrtc.RTPTransceiver{videoTr, audioTr}
-
-	// Create output tracks on all other participants for screen video+audio
-	for otherID, other := range s.participants {
-		if otherID == userID {
-			continue
-		}
-		s.addScreenOutputTracks(other, userID)
-	}
-
-	// Collect all participants for renegotiation
-	allParticipants := make(map[uuid.UUID]*participant, len(s.participants))
-	for id, p := range s.participants {
-		allParticipants[id] = p
-	}
-	s.mu.Unlock()
-
-	// Renegotiate all participants (sharer needs recv transceivers, viewers need send)
-	for id, p := range allParticipants {
-		s.renegotiate(id, p)
-	}
-
 	return true
 }
 
-// addScreenOutputTracks creates sendonly video+audio tracks on viewer's PC for screen share.
-// Caller must hold s.mu.
-func (s *VoiceSession) addScreenOutputTracks(viewer *participant, sharerID uuid.UUID) {
-	// Video track
-	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
-		"screen-video-"+sharerID.String(),
-		"screen-"+s.ChannelID.String(),
-	)
-	if err != nil {
-		log.Printf("voice: create screen video track error: %v", err)
-		return
-	}
-	vt, err := viewer.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionSendonly,
-	})
-	if err != nil {
-		log.Printf("voice: add screen video transceiver error: %v", err)
-		return
-	}
-	if err := vt.Sender().ReplaceTrack(videoTrack); err != nil {
-		log.Printf("voice: replace screen video track error: %v", err)
-		return
-	}
-	viewer.screenVideoTracks[sharerID] = videoTrack
-
-	// Audio track (system audio from screen share)
-	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
-		"screen-audio-"+sharerID.String(),
-		"screen-"+s.ChannelID.String(),
-	)
-	if err != nil {
-		log.Printf("voice: create screen audio track error: %v", err)
-		return
-	}
-	at, err := viewer.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionSendonly,
-	})
-	if err != nil {
-		log.Printf("voice: add screen audio transceiver error: %v", err)
-		return
-	}
-	if err := at.Sender().ReplaceTrack(audioTrack); err != nil {
-		log.Printf("voice: replace screen audio track error: %v", err)
-		return
-	}
-	viewer.screenAudioTracks[sharerID] = audioTrack
-}
-
-// StopScreenShare stops screen sharing for a user.
+// StopScreenShare stops screen sharing for a user. No renegotiation needed.
 func (s *VoiceSession) StopScreenShare(userID uuid.UUID) {
 	s.mu.Lock()
-
+	defer s.mu.Unlock()
 	if s.screenSharerID == nil || *s.screenSharerID != userID {
-		s.mu.Unlock()
 		return
 	}
-
 	p, ok := s.participants[userID]
 	if ok {
 		p.ScreenSharing = false
-		// Stop and clean up recv transceivers on the sharer's PC
-		for _, tr := range p.screenRecvTransceivers {
-			if err := tr.Stop(); err != nil {
-				log.Printf("voice: stop screen transceiver error: %v", err)
-			}
-		}
-		p.screenRecvTransceivers = nil
 	}
 	s.screenSharerID = nil
-
-	// Remove screen share output tracks from all viewers
-	for otherID, other := range s.participants {
-		if otherID == userID {
-			continue
-		}
-		s.removeScreenTracksFromParticipant(other, userID)
-	}
-
-	// Collect all participants for renegotiation (including sharer)
-	allParticipants := make(map[uuid.UUID]*participant, len(s.participants))
-	for id, p := range s.participants {
-		allParticipants[id] = p
-	}
-	s.mu.Unlock()
-
-	// Renegotiate all participants (sharer to remove recv, viewers to remove send)
-	for id, p := range allParticipants {
-		s.renegotiate(id, p)
-	}
 }
 
-// StartCamera marks a user as camera-on, adds a recv-only video transceiver on
-// their PC, and creates output video tracks for all other participants.
+// StartCamera marks a user as camera-on. Transceivers are pre-allocated,
+// so no renegotiation is needed — the client just calls replaceTrack.
 func (s *VoiceSession) StartCamera(userID uuid.UUID) {
 	s.mu.Lock()
-
 	p, ok := s.participants[userID]
 	if !ok {
 		s.mu.Unlock()
 		return
 	}
-
 	p.CameraOn = true
-
-	// Add recv-only video transceiver for camera
-	videoTr, err := p.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionRecvonly,
-	})
-	if err != nil {
-		log.Printf("voice: camera add video transceiver error: %v", err)
-		p.CameraOn = false
-		s.mu.Unlock()
-		return
-	}
-	p.cameraRecvTransceiver = videoTr
-
-	// Create output video tracks on all other participants
-	for otherID, other := range s.participants {
-		if otherID == userID {
-			continue
-		}
-		s.addCameraOutputTrack(other, userID)
-	}
-
-	// Collect all participants for renegotiation
-	allParticipants := make(map[uuid.UUID]*participant, len(s.participants))
-	for id, p := range s.participants {
-		allParticipants[id] = p
-	}
-	s.mu.Unlock()
-
-	// Renegotiate all (sender needs recv transceiver, viewers need send)
-	for id, p := range allParticipants {
-		s.renegotiate(id, p)
-	}
-}
-
-// addCameraOutputTrack creates a sendonly video track on viewer's PC for camera.
-// Caller must hold s.mu.
-func (s *VoiceSession) addCameraOutputTrack(viewer *participant, cameraUserID uuid.UUID) {
-	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
-		"camera-video-"+cameraUserID.String(),
-		"camera-"+cameraUserID.String(),
-	)
-	if err != nil {
-		log.Printf("voice: create camera video track error: %v", err)
-		return
-	}
-	vt, err := viewer.PC.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionSendonly,
-	})
-	if err != nil {
-		log.Printf("voice: add camera video transceiver error: %v", err)
-		return
-	}
-	if err := vt.Sender().ReplaceTrack(videoTrack); err != nil {
-		log.Printf("voice: replace camera video track error: %v", err)
-		return
-	}
-	viewer.cameraVideoTracks[cameraUserID] = videoTrack
-}
-
-// StopCamera stops camera for a user.
-func (s *VoiceSession) StopCamera(userID uuid.UUID) {
-	s.mu.Lock()
-
-	p, ok := s.participants[userID]
-	if !ok || !p.CameraOn {
-		s.mu.Unlock()
-		return
-	}
-
-	p.CameraOn = false
-	// Stop and clean up recv transceiver on the camera user's PC
+	// Send PLI for keyframe when camera resumes
 	if p.cameraRecvTransceiver != nil {
-		if err := p.cameraRecvTransceiver.Stop(); err != nil {
-			log.Printf("voice: stop camera transceiver error: %v", err)
-		}
-		p.cameraRecvTransceiver = nil
-	}
-
-	// Remove camera output tracks from all viewers
-	for otherID, other := range s.participants {
-		if otherID == userID {
-			continue
-		}
-		s.removeCameraTracksFromParticipant(other, userID)
-	}
-
-	// Collect all participants for renegotiation
-	allParticipants := make(map[uuid.UUID]*participant, len(s.participants))
-	for id, p := range s.participants {
-		allParticipants[id] = p
-	}
-	s.mu.Unlock()
-
-	for id, p := range allParticipants {
-		s.renegotiate(id, p)
-	}
-}
-
-// removeCameraTracksFromParticipant removes camera video tracks for a given
-// camera user from a viewer's PC. Caller holds s.mu.
-func (s *VoiceSession) removeCameraTracksFromParticipant(viewer *participant, cameraUserID uuid.UUID) {
-	if track, has := viewer.cameraVideoTracks[cameraUserID]; has {
-		for _, sender := range viewer.PC.GetSenders() {
-			if sender.Track() == track {
-				viewer.PC.RemoveTrack(sender)
-				break
+		if recv := p.cameraRecvTransceiver.Receiver(); recv != nil {
+			if track := recv.Track(); track != nil {
+				requestKeyframe(p.PC, track)
 			}
 		}
-		delete(viewer.cameraVideoTracks, cameraUserID)
 	}
+	s.mu.Unlock()
+}
+
+// StopCamera stops camera for a user. No renegotiation needed.
+func (s *VoiceSession) StopCamera(userID uuid.UUID) {
+	s.mu.Lock()
+	p, ok := s.participants[userID]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	p.CameraOn = false
+	s.mu.Unlock()
 }
 
 // requestKeyframe sends an RTCP PLI to the sender so the encoder generates a keyframe.
