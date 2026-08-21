@@ -68,6 +68,7 @@ export interface DMChannelView {
 	channel: Channel;
 	other_user: User;
 	last_message_at: string | null;
+	can_message: boolean;
 }
 
 export interface WSMessage {
@@ -95,6 +96,13 @@ export interface WSPresenceUpdate {
 export interface WSPresenceList {
 	type: 'presence_list';
 	user_ids: string[];
+}
+
+export interface WSBlockState {
+	type: 'block_state';
+	user_id: string;
+	blocked_either: boolean;
+	blocked_by_me: boolean;
 }
 
 export interface WSServerUpdate {

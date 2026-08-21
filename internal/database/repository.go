@@ -3,10 +3,16 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/Stocist/discard/internal/models"
 	"github.com/google/uuid"
+)
+
+var (
+	ErrBlocked        = errors.New("messaging is disabled for this conversation")
+	ErrNoSharedServer = errors.New("users do not share a server")
 )
 
 // UserRepo handles user-related database operations.
@@ -309,20 +315,40 @@ type BlockRepo struct {
 }
 
 func (r *BlockRepo) Block(ctx context.Context, blockerID, blockedID uuid.UUID) error {
-	_, err := r.DB.ExecContext(ctx,
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := lockUserPair(ctx, tx, blockerID, blockedID); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx,
 		`INSERT INTO user_blocks (blocker_id, blocked_id, created_at) VALUES ($1, $2, NOW())
 		 ON CONFLICT DO NOTHING`,
 		blockerID, blockedID,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *BlockRepo) Unblock(ctx context.Context, blockerID, blockedID uuid.UUID) error {
-	_, err := r.DB.ExecContext(ctx,
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := lockUserPair(ctx, tx, blockerID, blockedID); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx,
 		`DELETE FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2`,
 		blockerID, blockedID,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *BlockRepo) IsBlocked(ctx context.Context, userA, userB uuid.UUID) (bool, error) {
@@ -332,6 +358,16 @@ func (r *BlockRepo) IsBlocked(ctx context.Context, userA, userB uuid.UUID) (bool
 			SELECT 1 FROM user_blocks
 			WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)
 		)`, userA, userB,
+	).Scan(&exists)
+	return exists, err
+}
+
+func (r *BlockRepo) HasBlocked(ctx context.Context, blockerID, blockedID uuid.UUID) (bool, error) {
+	var exists bool
+	err := r.DB.QueryRowContext(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2
+		)`, blockerID, blockedID,
 	).Scan(&exists)
 	return exists, err
 }
@@ -416,14 +452,6 @@ type DMMemberRepo struct {
 	DB *sql.DB
 }
 
-func (r *DMMemberRepo) AddMember(ctx context.Context, channelID, userID uuid.UUID) error {
-	_, err := r.DB.ExecContext(ctx,
-		`INSERT INTO dm_members (channel_id, user_id, joined_at) VALUES ($1, $2, $3)`,
-		channelID, userID, time.Now(),
-	)
-	return err
-}
-
 func (r *DMMemberRepo) IsMember(ctx context.Context, channelID, userID uuid.UUID) (bool, error) {
 	var exists bool
 	err := r.DB.QueryRowContext(ctx,
@@ -433,9 +461,20 @@ func (r *DMMemberRepo) IsMember(ctx context.Context, channelID, userID uuid.UUID
 	return exists, err
 }
 
-func (r *DMMemberRepo) FindDMChannel(ctx context.Context, userA, userB uuid.UUID) (*models.Channel, error) {
+// OpenDM reopens an existing conversation or atomically creates one while
+// serialized with block and message operations for the same user pair.
+func (r *DMMemberRepo) OpenDM(ctx context.Context, userA, userB uuid.UUID) (*models.Channel, bool, error) {
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback()
+	if err := lockUserPair(ctx, tx, userA, userB); err != nil {
+		return nil, false, err
+	}
+
 	c := &models.Channel{}
-	err := r.DB.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT c.id, c.server_id, c.name, c.topic, c.type, c.position, c.created_at
 		 FROM channels c
 		 JOIN dm_members m1 ON m1.channel_id = c.id
@@ -443,17 +482,80 @@ func (r *DMMemberRepo) FindDMChannel(ctx context.Context, userA, userB uuid.UUID
 		 WHERE c.server_id IS NULL AND m1.user_id = $1 AND m2.user_id = $2`,
 		userA, userB,
 	).Scan(&c.ID, &c.ServerID, &c.Name, &c.Topic, &c.Type, &c.Position, &c.CreatedAt)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE dm_members SET closed = false WHERE channel_id = $1 AND user_id = $2`, c.ID, userA,
+		); err != nil {
+			return nil, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, false, err
+		}
+		return c, false, nil
 	}
-	return c, nil
+	if err != sql.ErrNoRows {
+		return nil, false, err
+	}
+
+	var blocked bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM user_blocks
+			WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)
+		)`, userA, userB,
+	).Scan(&blocked); err != nil {
+		return nil, false, err
+	}
+	if blocked {
+		return nil, false, ErrBlocked
+	}
+
+	var shared bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM server_members m1
+			JOIN server_members m2 ON m1.server_id = m2.server_id
+			WHERE m1.user_id = $1 AND m2.user_id = $2
+		)`, userA, userB,
+	).Scan(&shared); err != nil {
+		return nil, false, err
+	}
+	if !shared {
+		return nil, false, ErrNoSharedServer
+	}
+
+	c.ID = uuid.New()
+	c.Type = "dm"
+	c.CreatedAt = time.Now()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO channels (id, server_id, name, topic, type, position, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		c.ID, c.ServerID, c.Name, c.Topic, c.Type, c.Position, c.CreatedAt,
+	); err != nil {
+		return nil, false, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO dm_members (channel_id, user_id, joined_at) VALUES ($1, $2, $3), ($1, $4, $3)`,
+		c.ID, userA, c.CreatedAt, userB,
+	); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	return c, true, nil
 }
 
 func (r *DMMemberRepo) ListUserDMs(ctx context.Context, userID uuid.UUID) ([]models.DMChannelView, error) {
 	rows, err := r.DB.QueryContext(ctx,
 		`SELECT c.id, c.server_id, c.name, c.topic, c.type, c.position, c.created_at,
 		        u.id, u.username, u.display_name, u.avatar_path, u.tailscale_id, u.password_hash, u.status, u.created_at, u.updated_at,
-		        (SELECT MAX(m.created_at) FROM messages m WHERE m.channel_id = c.id)
+		        (SELECT MAX(m.created_at) FROM messages m WHERE m.channel_id = c.id),
+		        NOT EXISTS(
+		          SELECT 1 FROM user_blocks b
+		          WHERE (b.blocker_id = $1 AND b.blocked_id = u.id)
+		             OR (b.blocker_id = u.id AND b.blocked_id = $1)
+		        )
 		 FROM dm_members me
 		 JOIN channels c ON c.id = me.channel_id
 		 JOIN dm_members other ON other.channel_id = c.id AND other.user_id != $1
@@ -473,7 +575,7 @@ func (r *DMMemberRepo) ListUserDMs(ctx context.Context, userID uuid.UUID) ([]mod
 		if err := rows.Scan(
 			&v.Channel.ID, &v.Channel.ServerID, &v.Channel.Name, &v.Channel.Topic, &v.Channel.Type, &v.Channel.Position, &v.Channel.CreatedAt,
 			&v.OtherUser.ID, &v.OtherUser.Username, &v.OtherUser.DisplayName, &v.OtherUser.AvatarPath, &v.OtherUser.TailscaleID, &v.OtherUser.PasswordHash, &v.OtherUser.Status, &v.OtherUser.CreatedAt, &v.OtherUser.UpdatedAt,
-			&v.LastMessageAt,
+			&v.LastMessageAt, &v.CanMessage,
 		); err != nil {
 			return nil, err
 		}
@@ -482,17 +584,46 @@ func (r *DMMemberRepo) ListUserDMs(ctx context.Context, userID uuid.UUID) ([]mod
 	return views, rows.Err()
 }
 
+func (r *DMMemberRepo) GetDMView(ctx context.Context, channelID, userID uuid.UUID) (*models.DMChannelView, error) {
+	v := &models.DMChannelView{}
+	err := r.DB.QueryRowContext(ctx,
+		`SELECT c.id, c.server_id, c.name, c.topic, c.type, c.position, c.created_at,
+		        u.id, u.username, u.display_name, u.avatar_path, u.tailscale_id, u.password_hash, u.status, u.created_at, u.updated_at,
+		        (SELECT MAX(m.created_at) FROM messages m WHERE m.channel_id = c.id),
+		        NOT EXISTS(
+		          SELECT 1 FROM user_blocks b
+		          WHERE (b.blocker_id = $2 AND b.blocked_id = u.id)
+		             OR (b.blocker_id = u.id AND b.blocked_id = $2)
+		        )
+		 FROM dm_members me
+		 JOIN channels c ON c.id = me.channel_id
+		 JOIN dm_members other ON other.channel_id = c.id AND other.user_id != $2
+		 JOIN users u ON u.id = other.user_id
+		 WHERE me.channel_id = $1 AND me.user_id = $2 AND c.server_id IS NULL`,
+		channelID, userID,
+	).Scan(
+		&v.Channel.ID, &v.Channel.ServerID, &v.Channel.Name, &v.Channel.Topic, &v.Channel.Type, &v.Channel.Position, &v.Channel.CreatedAt,
+		&v.OtherUser.ID, &v.OtherUser.Username, &v.OtherUser.DisplayName, &v.OtherUser.AvatarPath, &v.OtherUser.TailscaleID, &v.OtherUser.PasswordHash, &v.OtherUser.Status, &v.OtherUser.CreatedAt, &v.OtherUser.UpdatedAt,
+		&v.LastMessageAt, &v.CanMessage,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+func (r *DMMemberRepo) GetOtherUserID(ctx context.Context, channelID, userID uuid.UUID) (uuid.UUID, error) {
+	var otherID uuid.UUID
+	err := r.DB.QueryRowContext(ctx,
+		`SELECT user_id FROM dm_members WHERE channel_id = $1 AND user_id != $2 LIMIT 1`,
+		channelID, userID,
+	).Scan(&otherID)
+	return otherID, err
+}
+
 func (r *DMMemberRepo) CloseDM(ctx context.Context, channelID, userID uuid.UUID) error {
 	_, err := r.DB.ExecContext(ctx,
 		`UPDATE dm_members SET closed = true WHERE channel_id = $1 AND user_id = $2`,
-		channelID, userID,
-	)
-	return err
-}
-
-func (r *DMMemberRepo) ReopenDM(ctx context.Context, channelID, userID uuid.UUID) error {
-	_, err := r.DB.ExecContext(ctx,
-		`UPDATE dm_members SET closed = false WHERE channel_id = $1 AND user_id = $2`,
 		channelID, userID,
 	)
 	return err
@@ -504,11 +635,19 @@ type MessageRepo struct {
 }
 
 func (r *MessageRepo) Create(ctx context.Context, m *models.Message) error {
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := lockDMConversation(ctx, tx, m.ChannelID, m.AuthorID); err != nil {
+		return err
+	}
 	m.ID = uuid.New()
 	now := time.Now()
 	m.CreatedAt = now
 	m.UpdatedAt = now
-	err := r.DB.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`WITH ins AS (
 			INSERT INTO messages (id, channel_id, author_id, content, edited, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -517,7 +656,10 @@ func (r *MessageRepo) Create(ctx context.Context, m *models.Message) error {
 		SELECT u.username, u.display_name, u.avatar_path FROM ins JOIN users u ON u.id = ins.author_id`,
 		m.ID, m.ChannelID, m.AuthorID, m.Content, m.Edited, m.CreatedAt, m.UpdatedAt,
 	).Scan(&m.AuthorUsername, &m.AuthorDisplayName, &m.AuthorAvatarURL)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *MessageRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.Message, error) {
@@ -535,8 +677,22 @@ func (r *MessageRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.Messag
 }
 
 func (r *MessageRepo) Update(ctx context.Context, messageID, authorID uuid.UUID, content string) (*models.Message, error) {
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var channelID uuid.UUID
+	if err := tx.QueryRowContext(ctx,
+		`SELECT channel_id FROM messages WHERE id = $1 AND author_id = $2`, messageID, authorID,
+	).Scan(&channelID); err != nil {
+		return nil, err
+	}
+	if err := lockDMConversation(ctx, tx, channelID, authorID); err != nil {
+		return nil, err
+	}
 	m := &models.Message{}
-	err := r.DB.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`WITH upd AS (
 			UPDATE messages SET content = $1, edited = true, updated_at = $2
 			WHERE id = $3 AND author_id = $4
@@ -549,7 +705,68 @@ func (r *MessageRepo) Update(ctx context.Context, messageID, authorID uuid.UUID,
 	if err != nil {
 		return nil, err
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 	return m, nil
+}
+
+func lockDMConversation(ctx context.Context, tx *sql.Tx, channelID, userID uuid.UUID) error {
+	var serverID *uuid.UUID
+	if err := tx.QueryRowContext(ctx, `SELECT server_id FROM channels WHERE id = $1`, channelID).Scan(&serverID); err != nil {
+		return err
+	}
+	if serverID != nil {
+		return nil
+	}
+	var otherID uuid.UUID
+	if err := tx.QueryRowContext(ctx,
+		`SELECT user_id FROM dm_members WHERE channel_id = $1 AND user_id != $2 LIMIT 1`,
+		channelID, userID,
+	).Scan(&otherID); err != nil {
+		return err
+	}
+	if err := lockUserPair(ctx, tx, userID, otherID); err != nil {
+		return err
+	}
+	var blocked bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM user_blocks
+			WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)
+		)`, userID, otherID,
+	).Scan(&blocked); err != nil {
+		return err
+	}
+	if blocked {
+		return ErrBlocked
+	}
+	return nil
+}
+
+func lockUserPair(ctx context.Context, tx *sql.Tx, userA, userB uuid.UUID) error {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM users WHERE id = $1 OR id = $2 ORDER BY id FOR UPDATE`, userA, userB,
+	)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if count != 2 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (r *MessageRepo) Delete(ctx context.Context, messageID, authorID uuid.UUID) error {

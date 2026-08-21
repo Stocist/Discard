@@ -3,6 +3,7 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/Stocist/discard/internal/models"
 )
+
+var ErrMessageForbidden = errors.New("message forbidden")
 
 const (
 	writeWait  = 10 * time.Second
@@ -32,6 +35,9 @@ type MessageHandler func(ctx context.Context, channelID uuid.UUID, authorID uuid
 // MembershipChecker verifies a user belongs to a channel before subscribing.
 type MembershipChecker func(ctx context.Context, userID uuid.UUID, channelID uuid.UUID) (bool, error)
 
+// MessagePermissionChecker verifies that a member may currently send to a channel.
+type MessagePermissionChecker func(ctx context.Context, userID uuid.UUID, channelID uuid.UUID) (bool, error)
+
 // Client is a middleman between a WebSocket connection and the Hub.
 type Client struct {
 	hub        *Hub
@@ -47,6 +53,7 @@ type Client struct {
 
 	// CheckMembership is called before subscribing to a channel.
 	CheckMembership MembershipChecker
+	CanSendMessage  MessagePermissionChecker
 
 	// OnVoice handles voice channel signaling.
 	OnVoice VoiceHandler
@@ -261,7 +268,7 @@ func (c *Client) sendError(message string) {
 }
 
 func (c *Client) handlePresenceRequest() {
-	ids := c.hub.presence.OnlineUserIDs()
+	ids := c.hub.OnlineUserIDsFor(context.Background(), c.UserID)
 	strs := make([]string, len(ids))
 	for i, id := range ids {
 		strs[i] = id.String()
@@ -496,9 +503,25 @@ func (c *Client) handleChatMessage(msg incomingMessage) {
 			return
 		}
 	}
+	if c.CanSendMessage != nil {
+		ok, err := c.CanSendMessage(context.Background(), c.UserID, channelID)
+		if err != nil {
+			log.Printf("ws message permission check error: %v", err)
+			c.sendError("failed to verify message permission")
+			return
+		}
+		if !ok {
+			c.sendError("messaging is disabled for this conversation")
+			return
+		}
+	}
 
 	saved, err := c.OnMessage(context.Background(), channelID, c.UserID, msg.Content)
 	if err != nil {
+		if errors.Is(err, ErrMessageForbidden) {
+			c.sendError("messaging is disabled for this conversation")
+			return
+		}
 		log.Printf("ws message handler error: %v", err)
 		return
 	}

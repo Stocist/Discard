@@ -4,12 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	gorillaWs "github.com/gorilla/websocket"
@@ -34,6 +36,7 @@ type Server struct {
 	uploadDir  string
 	voiceMgr   ws.VoiceHandler
 	turnSecret string
+	blockMu    sync.Mutex
 }
 
 func NewServer(db *sql.DB, hub *ws.Hub, voiceMgr ws.VoiceHandler, turnSecret string) *Server {
@@ -41,6 +44,11 @@ func NewServer(db *sql.DB, hub *ws.Hub, voiceMgr ws.VoiceHandler, turnSecret str
 	if uploadDir == "" {
 		uploadDir = "./uploads"
 	}
+	blockRepo := &database.BlockRepo{DB: db}
+	hub.SetPresenceVisibilityChecker(func(ctx context.Context, viewerID, subjectID uuid.UUID) (bool, error) {
+		blocked, err := blockRepo.IsBlocked(ctx, viewerID, subjectID)
+		return !blocked, err
+	})
 	return &Server{
 		db:         db,
 		hub:        hub,
@@ -92,6 +100,7 @@ func (s *Server) SetupRoutes() {
 	// DMs
 	a("POST /api/dm/open", s.handleOpenDM)
 	a("GET /api/dm", s.handleListDMs)
+	a("GET /api/dm/{channelId}", s.handleGetDM)
 	a("PUT /api/dm/{channelId}/close", s.handleCloseDM)
 
 	// Blocks
@@ -188,6 +197,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			Content:   content,
 		}
 		if err := msgRepo.Create(ctx, msg); err != nil {
+			if errors.Is(err, database.ErrBlocked) {
+				return nil, ws.ErrMessageForbidden
+			}
 			return nil, err
 		}
 		return msg, nil
@@ -206,8 +218,24 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		return dmRepo.IsMember(ctx, channelID, userID)
 	}
+	messageChecker := func(ctx context.Context, userID, channelID uuid.UUID) (bool, error) {
+		ch, err := channelRepo.GetChannelByID(ctx, channelID)
+		if err != nil {
+			return false, err
+		}
+		if ch.ServerID != nil {
+			return true, nil
+		}
+		otherID, err := dmRepo.GetOtherUserID(ctx, channelID, userID)
+		if err != nil {
+			return false, err
+		}
+		blocked, err := (&database.BlockRepo{DB: s.db}).IsBlocked(ctx, userID, otherID)
+		return !blocked, err
+	}
 
 	client := ws.NewClient(conn, user.ID, handler, checker)
+	client.CanSendMessage = messageChecker
 	if user.DisplayName != nil {
 		client.Username = *user.DisplayName
 	} else {
@@ -232,12 +260,16 @@ func (s *Server) handleTurnCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	username, credential, ttl := discardTurn.GenerateCredentials(s.turnSecret)
+	turnPort, err := discardTurn.Port()
+	if err != nil {
+		http.Error(w, `{"error":"invalid TURN configuration"}`, http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"urls": []string{
-			fmt.Sprintf("turn:%s:3478?transport=udp", host),
-			fmt.Sprintf("turn:%s:3478?transport=tcp", host),
+			fmt.Sprintf("turn:%s:%d?transport=udp", host, turnPort),
 		},
 		"username":   username,
 		"credential": credential,

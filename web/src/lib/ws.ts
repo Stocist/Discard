@@ -1,4 +1,5 @@
 import { handleVoiceMessage, cleanupVoiceOnDisconnect } from './voice';
+import { applyBlockState, isBlockedEither } from './blocks';
 
 // Module-level presence state.
 // Use a callback pattern to notify subscribers since $state() only works in .svelte files.
@@ -43,20 +44,20 @@ function handleServerMessage(data: { type: string; server?: Server; server_id?: 
 
 function handlePresenceMessage(data: { type: string; user_id?: string; status?: string; user_ids?: string[] }) {
 	if (data.type === 'presence_update' && data.user_id && data.status) {
-		if (data.status === 'online') {
+		if (data.status === 'online' && !isBlockedEither(data.user_id)) {
 			onlineSet.add(data.user_id);
 		} else {
 			onlineSet.delete(data.user_id);
 		}
 		notify();
 	} else if (data.type === 'presence_list' && data.user_ids) {
-		onlineSet = new Set(data.user_ids);
+		onlineSet = new Set(data.user_ids.filter((id) => !isBlockedEither(id)));
 		notify();
 	}
 }
 
 // DM event callbacks.
-type DMEvent = { type: 'dm_opened'; channel: Channel; opener: User };
+type DMEvent = { type: 'dm_opened'; channel: Channel; opener: User; can_message: boolean };
 type DMEventHandler = (event: DMEvent) => void;
 let dmListeners = new Set<DMEventHandler>();
 
@@ -123,6 +124,12 @@ export function createWSConnection(opts?: { handleVoice?: boolean }): WebSocket 
 				if (handleVoice) handleVoiceMessage(ws, data);
 			} else if (data.type === 'presence_update' || data.type === 'presence_list') {
 				handlePresenceMessage(data);
+			} else if (data.type === 'block_state' && data.user_id) {
+				applyBlockState(data.user_id, !!data.blocked_either, !!data.blocked_by_me);
+				if (data.blocked_either) {
+					onlineSet.delete(data.user_id);
+					notify();
+				}
 			} else if (data.type === 'server_update' || data.type === 'server_delete') {
 				handleServerMessage(data);
 			} else if (data.type === 'dm_opened' && data.channel && data.opener) {

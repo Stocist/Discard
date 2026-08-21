@@ -5,11 +5,13 @@
 	import ServerSidebar from '$lib/components/ServerSidebar.svelte';
 	import InstallPrompt from '$lib/components/InstallPrompt.svelte';
 	import { fetchMe } from '$lib/api';
+	import { initializeBlockState } from '$lib/blocks';
 
 	let { children } = $props();
 
 	let sidebarOpen = $state(false);
 	let authenticated = $state(false);
+	let privacyError = $state(false);
 
 	// Share sidebar state with child pages via context
 	const sidebarState = {
@@ -31,9 +33,16 @@
 	onMount(async () => {
 		try {
 			await fetchMe();
-			authenticated = true;
 		} catch {
 			goto('/login?reason=unauthenticated', { replaceState: true });
+			return;
+		}
+		try {
+			await initializeBlockState();
+			authenticated = true;
+		} catch (error) {
+			console.error('Failed to load blocks:', error);
+			privacyError = true;
 		}
 	});
 </script>
@@ -66,6 +75,10 @@
 
 		<InstallPrompt />
 	</div>
+{:else if privacyError}
+	<div class="loading">
+		<p>Unable to load privacy settings. <button onclick={() => location.reload()}>Retry</button></p>
+	</div>
 {:else}
 	<div class="loading">
 		<p>Loading...</p>
@@ -80,6 +93,11 @@
 		justify-content: center;
 		height: 100vh;
 		color: var(--text-muted);
+	}
+
+	.loading button {
+		color: var(--accent);
+		text-decoration: underline;
 	}
 
 	.app-shell {

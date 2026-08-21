@@ -217,16 +217,25 @@ export function listDMs(): Promise<DMChannelView[]> {
 	return apiFetch('/dm');
 }
 
+export function getDM(channelId: string): Promise<DMChannelView> {
+	return apiFetch(`/dm/${channelId}`);
+}
+
 export function closeDM(channelId: string): Promise<void> {
 	return apiFetch(`/dm/${channelId}/close`, { method: 'PUT' });
 }
 
 // Blocks
-export function blockUser(userId: string): Promise<void> {
+export interface BlockStateResponse {
+	blocked_either: boolean;
+	blocked_by_me: boolean;
+}
+
+export function blockUser(userId: string): Promise<BlockStateResponse> {
 	return apiFetch('/blocks', { method: 'POST', body: JSON.stringify({ user_id: userId }) });
 }
 
-export function unblockUser(userId: string): Promise<void> {
+export function unblockUser(userId: string): Promise<BlockStateResponse> {
 	return apiFetch(`/blocks/${userId}`, { method: 'DELETE' });
 }
 

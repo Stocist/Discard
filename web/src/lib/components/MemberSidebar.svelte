@@ -4,6 +4,7 @@
 	import type { ServerMember } from '$lib/types';
 	import { isUserOnline, subscribePresence } from '$lib/ws';
 	import { openDM, blockUser, avatarSrc } from '$lib/api';
+	import { applyBlockState } from '$lib/blocks';
 
 	let { members = [], visible = true, currentUserId = '' }: {
 		members?: ServerMember[];
@@ -45,7 +46,8 @@
 	async function handleBlock() {
 		if (!confirmBlock) return;
 		try {
-			await blockUser(confirmBlock.user_id);
+			const state = await blockUser(confirmBlock.user_id);
+			applyBlockState(confirmBlock.user_id, state.blocked_either, state.blocked_by_me);
 		} catch (e) {
 			console.error('Failed to block user:', e);
 		}

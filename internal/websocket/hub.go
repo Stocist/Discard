@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"sync"
@@ -17,7 +18,8 @@ type Hub struct {
 	// allClients tracks every connected client for global broadcasts (e.g. presence).
 	allClients map[*Client]struct{}
 
-	presence *PresenceTracker
+	presence       *PresenceTracker
+	canSeePresence PresenceVisibilityChecker
 
 	register   chan *Client
 	unregister chan *Client
@@ -29,6 +31,9 @@ type Hub struct {
 
 	mu sync.RWMutex
 }
+
+// PresenceVisibilityChecker returns whether viewer may see subject's presence.
+type PresenceVisibilityChecker func(ctx context.Context, viewerID, subjectID uuid.UUID) (bool, error)
 
 type subscribeRequest struct {
 	client    *Client
@@ -56,6 +61,29 @@ func NewHub() *Hub {
 // Presence returns the hub's presence tracker (used by REST handlers).
 func (h *Hub) Presence() *PresenceTracker {
 	return h.presence
+}
+
+func (h *Hub) SetPresenceVisibilityChecker(checker PresenceVisibilityChecker) {
+	h.canSeePresence = checker
+}
+
+func (h *Hub) OnlineUserIDsFor(ctx context.Context, viewerID uuid.UUID) []uuid.UUID {
+	ids := h.presence.OnlineUserIDs()
+	if h.canSeePresence == nil {
+		return ids
+	}
+	visible := make([]uuid.UUID, 0, len(ids))
+	for _, id := range ids {
+		ok, err := h.canSeePresence(ctx, viewerID, id)
+		if err != nil {
+			log.Printf("presence visibility check error: %v", err)
+			continue
+		}
+		if ok {
+			visible = append(visible, id)
+		}
+	}
+	return visible
 }
 
 // Run starts the hub event loop. Should be called in its own goroutine.
@@ -155,13 +183,64 @@ func (h *Hub) broadcastPresence(userID uuid.UUID, status string) {
 		return
 	}
 	h.mu.RLock()
+	clients := make([]*Client, 0, len(h.allClients))
 	for client := range h.allClients {
-		select {
-		case client.send <- data:
-		default:
-		}
+		clients = append(clients, client)
 	}
 	h.mu.RUnlock()
+	for _, client := range clients {
+		if h.canSeePresence != nil {
+			ok, checkErr := h.canSeePresence(context.Background(), client.UserID, userID)
+			if checkErr != nil {
+				log.Printf("presence visibility check error: %v", checkErr)
+				continue
+			}
+			if !ok {
+				continue
+			}
+		}
+		h.SendToClient(client, data)
+	}
+}
+
+// NotifyBlockState synchronizes block and presence state for both users.
+func (h *Hub) NotifyBlockState(userA, userB uuid.UUID, aBlockedB, bBlockedA bool) {
+	blockedEither := aBlockedB || bBlockedA
+	h.sendBlockState(userA, userB, blockedEither, aBlockedB)
+	h.sendBlockState(userB, userA, blockedEither, bBlockedA)
+
+	statusA, statusB := "offline", "offline"
+	if !blockedEither {
+		if h.presence.IsOnline(userA) {
+			statusA = "online"
+		}
+		if h.presence.IsOnline(userB) {
+			statusB = "online"
+		}
+	}
+	h.sendPresenceUpdate(userA, userB, statusB)
+	h.sendPresenceUpdate(userB, userA, statusA)
+}
+
+func (h *Hub) sendBlockState(recipientID, otherID uuid.UUID, blockedEither, blockedByMe bool) {
+	data, err := json.Marshal(map[string]any{
+		"type":           "block_state",
+		"user_id":        otherID.String(),
+		"blocked_either": blockedEither,
+		"blocked_by_me":  blockedByMe,
+	})
+	if err == nil {
+		h.SendToUser(recipientID, data)
+	}
+}
+
+func (h *Hub) sendPresenceUpdate(recipientID, subjectID uuid.UUID, status string) {
+	data, err := json.Marshal(map[string]string{
+		"type": "presence_update", "user_id": subjectID.String(), "status": status,
+	})
+	if err == nil {
+		h.SendToUser(recipientID, data)
+	}
 }
 
 // BroadcastAll sends data to every connected client.
@@ -178,6 +257,11 @@ func (h *Hub) BroadcastAll(data []byte) {
 
 // SendToClient sends raw JSON data to a single client.
 func (h *Hub) SendToClient(client *Client, data []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if _, ok := h.allClients[client]; !ok {
+		return
+	}
 	select {
 	case client.send <- data:
 	default:

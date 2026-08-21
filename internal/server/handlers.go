@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -836,79 +838,52 @@ func (s *Server) handleOpenDM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	blockRepo := &database.BlockRepo{DB: s.db}
-	blocked, err := blockRepo.IsBlocked(r.Context(), user.ID, targetID)
-	if err != nil {
-		jsonError(w, "failed to check blocks", http.StatusInternalServerError)
-		return
-	}
-	if blocked {
+	dmRepo := &database.DMMemberRepo{DB: s.db}
+	channel, created, err := dmRepo.OpenDM(r.Context(), user.ID, targetID)
+	if errors.Is(err, database.ErrBlocked) {
 		jsonError(w, "cannot open DM with this user", http.StatusForbidden)
 		return
 	}
-
-	memberRepo := &database.ServerMemberRepo{DB: s.db}
-	shared, err := memberRepo.ShareServer(r.Context(), user.ID, targetID)
-	if err != nil {
-		jsonError(w, "failed to check shared servers", http.StatusInternalServerError)
-		return
-	}
-	if !shared {
+	if errors.Is(err, database.ErrNoSharedServer) {
 		jsonError(w, "you must share a server to DM this user", http.StatusForbidden)
 		return
 	}
-
-	dmRepo := &database.DMMemberRepo{DB: s.db}
-	existing, err := dmRepo.FindDMChannel(r.Context(), user.ID, targetID)
-	if err == nil {
-		// Channel exists — reopen if closed for this user.
-		if reopenErr := dmRepo.ReopenDM(r.Context(), existing.ID, user.ID); reopenErr != nil {
-			jsonError(w, "failed to reopen DM", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(existing)
-
-		// Notify the other user.
-		out, _ := json.Marshal(map[string]any{
-			"type":       "dm_opened",
-			"channel_id": existing.ID.String(),
-		})
-		s.hub.SendToUser(targetID, out)
-		return
-	}
-	if err != sql.ErrNoRows {
-		jsonError(w, "failed to find DM channel", http.StatusInternalServerError)
+	if err != nil {
+		jsonError(w, "failed to open DM", http.StatusInternalServerError)
 		return
 	}
 
-	// Create new DM channel.
-	ch := &models.Channel{Type: "dm"}
-	channelRepo := &database.ChannelRepo{DB: s.db}
-	if err := channelRepo.CreateChannel(r.Context(), ch); err != nil {
-		jsonError(w, "failed to create DM channel", http.StatusInternalServerError)
+	view, err := dmRepo.GetDMView(r.Context(), channel.ID, user.ID)
+	if err != nil {
+		jsonError(w, "failed to load DM", http.StatusInternalServerError)
 		return
 	}
-
-	if err := dmRepo.AddMember(r.Context(), ch.ID, user.ID); err != nil {
-		jsonError(w, "failed to add DM member", http.StatusInternalServerError)
-		return
+	if view.CanMessage {
+		s.notifyDMOpened(r.Context(), targetID, channel.ID)
 	}
-	if err := dmRepo.AddMember(r.Context(), ch.ID, targetID); err != nil {
-		jsonError(w, "failed to add DM member", http.StatusInternalServerError)
-		return
-	}
-
-	// Notify the other user.
-	out, _ := json.Marshal(map[string]any{
-		"type":       "dm_opened",
-		"channel_id": ch.ID.String(),
-	})
-	s.hub.SendToUser(targetID, out)
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(ch)
+	if created {
+		w.WriteHeader(http.StatusCreated)
+	}
+	json.NewEncoder(w).Encode(view)
+}
+
+func (s *Server) notifyDMOpened(ctx context.Context, userID, channelID uuid.UUID) {
+	view, err := (&database.DMMemberRepo{DB: s.db}).GetDMView(ctx, channelID, userID)
+	if err != nil {
+		log.Printf("failed to load DM event view: %v", err)
+		return
+	}
+	if !view.CanMessage {
+		return
+	}
+	out, err := json.Marshal(map[string]any{
+		"type": "dm_opened", "channel": view.Channel, "opener": view.OtherUser, "can_message": view.CanMessage,
+	})
+	if err == nil {
+		s.hub.SendToUser(userID, out)
+	}
 }
 
 func (s *Server) handleListDMs(w http.ResponseWriter, r *http.Request) {
@@ -930,6 +905,30 @@ func (s *Server) handleListDMs(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(dms)
+}
+
+func (s *Server) handleGetDM(w http.ResponseWriter, r *http.Request) {
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	channelID, err := uuid.Parse(r.PathValue("channelId"))
+	if err != nil {
+		jsonError(w, "invalid channel id", http.StatusBadRequest)
+		return
+	}
+	view, err := (&database.DMMemberRepo{DB: s.db}).GetDMView(r.Context(), channelID, user.ID)
+	if err == sql.ErrNoRows {
+		jsonError(w, "DM not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, "failed to get DM", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(view)
 }
 
 func (s *Server) handleCloseDM(w http.ResponseWriter, r *http.Request) {
@@ -982,19 +981,22 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.blockMu.Lock()
+	defer s.blockMu.Unlock()
 	blockRepo := &database.BlockRepo{DB: s.db}
 	if err := blockRepo.Block(r.Context(), user.ID, targetID); err != nil {
 		jsonError(w, "failed to block user", http.StatusInternalServerError)
 		return
 	}
 
-	// Close any open DM between the two users.
-	dmRepo := &database.DMMemberRepo{DB: s.db}
-	if ch, err := dmRepo.FindDMChannel(r.Context(), user.ID, targetID); err == nil {
-		_ = dmRepo.CloseDM(r.Context(), ch.ID, user.ID)
+	reverse, err := blockRepo.HasBlocked(r.Context(), targetID, user.ID)
+	if err != nil {
+		log.Printf("failed to load reverse block state: %v", err)
 	}
+	s.hub.NotifyBlockState(user.ID, targetID, true, reverse)
 
-	w.WriteHeader(http.StatusNoContent)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"blocked_either": true, "blocked_by_me": true})
 }
 
 func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
@@ -1010,13 +1012,22 @@ func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.blockMu.Lock()
+	defer s.blockMu.Unlock()
 	blockRepo := &database.BlockRepo{DB: s.db}
 	if err := blockRepo.Unblock(r.Context(), user.ID, targetID); err != nil {
 		jsonError(w, "failed to unblock user", http.StatusInternalServerError)
 		return
 	}
+	reverse, err := blockRepo.HasBlocked(r.Context(), targetID, user.ID)
+	if err != nil {
+		log.Printf("failed to load reverse block state: %v", err)
+		reverse = true
+	}
+	s.hub.NotifyBlockState(user.ID, targetID, false, reverse)
 
-	w.WriteHeader(http.StatusNoContent)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"blocked_either": reverse, "blocked_by_me": false})
 }
 
 func (s *Server) handleListBlocks(w http.ResponseWriter, r *http.Request) {
@@ -1043,7 +1054,12 @@ func (s *Server) handleListBlocks(w http.ResponseWriter, r *http.Request) {
 // --- Presence ---
 
 func (s *Server) handlePresence(w http.ResponseWriter, r *http.Request) {
-	ids := s.hub.Presence().OnlineUserIDs()
+	user := auth.UserFromContext(r.Context())
+	if user == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	ids := s.hub.OnlineUserIDsFor(r.Context(), user.ID)
 	strs := make([]string, len(ids))
 	for i, id := range ids {
 		strs[i] = id.String()
@@ -1200,6 +1216,20 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		otherID, err := dmRepo.GetOtherUserID(r.Context(), channelID, user.ID)
+		if err != nil {
+			jsonError(w, "failed to load DM participant", http.StatusInternalServerError)
+			return
+		}
+		blocked, err := (&database.BlockRepo{DB: s.db}).IsBlocked(r.Context(), user.ID, otherID)
+		if err != nil {
+			jsonError(w, "failed to check blocks", http.StatusInternalServerError)
+			return
+		}
+		if blocked {
+			jsonError(w, "messaging is disabled for this conversation", http.StatusForbidden)
+			return
+		}
 	}
 
 	// Parse multipart form — 10 MB max memory.
@@ -1228,6 +1258,10 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	msgRepo := &database.MessageRepo{DB: s.db}
 	if err := msgRepo.Create(r.Context(), msg); err != nil {
+		if errors.Is(err, database.ErrBlocked) {
+			jsonError(w, "messaging is disabled for this conversation", http.StatusForbidden)
+			return
+		}
 		jsonError(w, "failed to create message", http.StatusInternalServerError)
 		return
 	}
@@ -1308,12 +1342,44 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	msgRepo := &database.MessageRepo{DB: s.db}
-	updated, err := msgRepo.Update(r.Context(), messageID, user.ID, input.Content)
-	if err == sql.ErrNoRows {
+	existing, err := msgRepo.GetByID(r.Context(), messageID)
+	if err == sql.ErrNoRows || (err == nil && existing.AuthorID != user.ID) {
 		jsonError(w, "message not found or not yours", http.StatusNotFound)
 		return
 	}
 	if err != nil {
+		jsonError(w, "failed to get message", http.StatusInternalServerError)
+		return
+	}
+	channel, err := (&database.ChannelRepo{DB: s.db}).GetChannelByID(r.Context(), existing.ChannelID)
+	if err != nil {
+		jsonError(w, "failed to get channel", http.StatusInternalServerError)
+		return
+	}
+	if channel.ServerID == nil {
+		dmRepo := &database.DMMemberRepo{DB: s.db}
+		otherID, peerErr := dmRepo.GetOtherUserID(r.Context(), existing.ChannelID, user.ID)
+		if peerErr != nil {
+			jsonError(w, "failed to load DM participant", http.StatusInternalServerError)
+			return
+		}
+		blocked, blockErr := (&database.BlockRepo{DB: s.db}).IsBlocked(r.Context(), user.ID, otherID)
+		if blockErr != nil {
+			jsonError(w, "failed to check blocks", http.StatusInternalServerError)
+			return
+		}
+		if blocked {
+			jsonError(w, "messaging is disabled for this conversation", http.StatusForbidden)
+			return
+		}
+	}
+
+	updated, err := msgRepo.Update(r.Context(), messageID, user.ID, input.Content)
+	if err != nil {
+		if errors.Is(err, database.ErrBlocked) {
+			jsonError(w, "messaging is disabled for this conversation", http.StatusForbidden)
+			return
+		}
 		jsonError(w, "failed to update message", http.StatusInternalServerError)
 		return
 	}

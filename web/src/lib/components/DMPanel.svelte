@@ -4,6 +4,7 @@
 	import type { DMChannelView, User } from '$lib/types';
 	import { listDMs, closeDM, listBlocks, unblockUser, avatarSrc } from '$lib/api';
 	import { subscribeDMEvents } from '$lib/ws';
+	import { applyBlockState } from '$lib/blocks';
 
 	let { onclose }: { onclose: () => void } = $props();
 
@@ -56,7 +57,8 @@
 
 	async function handleUnblock(userId: string) {
 		try {
-			await unblockUser(userId);
+			const state = await unblockUser(userId);
+			applyBlockState(userId, state.blocked_either, state.blocked_by_me);
 			blocks = blocks.filter(b => b.id !== userId);
 		} catch (e) {
 			console.error('Failed to unblock user:', e);
@@ -75,7 +77,8 @@
 				const newDM: DMChannelView = {
 					channel: event.channel,
 					other_user: event.opener,
-					last_message_at: null
+					last_message_at: null,
+					can_message: event.can_message
 				};
 				if (!dms.some(d => d.channel.id === event.channel.id)) {
 					dms = sortDMs([newDM, ...dms]);

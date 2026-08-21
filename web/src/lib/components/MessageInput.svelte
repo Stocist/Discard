@@ -2,10 +2,12 @@
 	import { createMessage } from '$lib/api';
 	import FileUpload from './FileUpload.svelte';
 
-	let { channelId, channelName, onSend }: {
+	let { channelId, channelName, onSend, disabled = false, isDM = false }: {
 		channelId: string;
 		channelName: string;
 		onSend: (content: string) => void;
+		disabled?: boolean;
+		isDM?: boolean;
 	} = $props();
 
 	let content = $state('');
@@ -13,7 +15,15 @@
 	let sending = $state(false);
 	let fileInput: HTMLInputElement | undefined = $state();
 
+	$effect(() => {
+		if (disabled) {
+			content = '';
+			files = [];
+		}
+	});
+
 	function handleKeydown(e: KeyboardEvent) {
+		if (disabled) return;
 		if (e.key === 'Enter' && !e.shiftKey) {
 			e.preventDefault();
 			send();
@@ -21,6 +31,7 @@
 	}
 
 	async function send() {
+		if (disabled) return;
 		const trimmed = content.trim();
 		if (!trimmed && files.length === 0) return;
 		if (sending) return;
@@ -46,10 +57,12 @@
 	}
 
 	function openFilePicker() {
+		if (disabled) return;
 		fileInput?.click();
 	}
 
 	function handleFileSelect(e: Event) {
+		if (disabled) return;
 		const input = e.target as HTMLInputElement;
 		if (input.files) {
 			files = [...files, ...Array.from(input.files)];
@@ -63,6 +76,7 @@
 	}
 
 	function handlePaste(e: ClipboardEvent) {
+		if (disabled) return;
 		const items = e.clipboardData?.items;
 		if (!items) return;
 
@@ -86,11 +100,13 @@
 	}
 
 	function handleDragOver(e: DragEvent) {
+		if (disabled) return;
 		e.preventDefault();
 	}
 
 	function handleDrop(e: DragEvent) {
 		e.preventDefault();
+		if (disabled) return;
 		if (e.dataTransfer?.files) {
 			files = [...files, ...Array.from(e.dataTransfer.files)];
 		}
@@ -99,31 +115,35 @@
 
 <div
 	class="input-wrapper"
+	class:disabled
 	role="region"
 	ondragover={handleDragOver}
 	ondrop={handleDrop}
 >
-	<FileUpload bind:files onRemove={removeFile} />
+	{#if !disabled}
+		<FileUpload bind:files onRemove={removeFile} />
+	{/if}
 	<div class="input-row">
-		<button class="attach-btn" onclick={openFilePicker} aria-label="Attach files" title="Attach files">
+		<button class="attach-btn" onclick={openFilePicker} aria-label="Attach files" title="Attach files" {disabled}>
 			<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 				<path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
 			</svg>
 		</button>
 		<textarea
 			class="message-input"
-			placeholder="Message #{channelName}"
+			placeholder={disabled ? 'You cannot message this user' : `Message ${isDM ? '@' : '#'}${channelName}`}
 			bind:value={content}
 			onkeydown={handleKeydown}
 			onpaste={handlePaste}
 			rows="1"
-			disabled={sending}
+			disabled={sending || disabled}
 		></textarea>
 	</div>
 	<input
 		bind:this={fileInput}
 		type="file"
 		multiple
+		{disabled}
 		onchange={handleFileSelect}
 		style="display:none"
 	/>
@@ -132,6 +152,10 @@
 <style>
 	.input-wrapper {
 		padding: 0 16px 16px;
+	}
+
+	.input-wrapper.disabled .input-row {
+		opacity: 0.65;
 	}
 
 	.input-row {
@@ -160,6 +184,10 @@
 
 	.attach-btn:hover {
 		color: var(--text-primary);
+	}
+
+	.attach-btn:disabled {
+		cursor: not-allowed;
 	}
 
 	.message-input {

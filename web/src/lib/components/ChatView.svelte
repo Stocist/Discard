@@ -3,6 +3,7 @@
 	import { listMessages, editMessage, deleteMessage, avatarSrc } from '$lib/api';
 	import { fetchMe } from '$lib/api';
 	import { subscribe, unsubscribe, sendMessage } from '$lib/ws';
+	import { isBlockedByMe, subscribeBlockState } from '$lib/blocks';
 	import { renderMarkdown } from '$lib/markdown';
 	import MessageInput from './MessageInput.svelte';
 	import AttachmentPreview from './AttachmentPreview.svelte';
@@ -22,11 +23,13 @@
 		return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
 	}
 
-	let { channelId, channelName, onToggleMembers, ws }: {
+	let { channelId, channelName, onToggleMembers, ws, isDM = false, canMessage = true }: {
 		channelId: string;
 		channelName: string;
 		onToggleMembers?: () => void;
 		ws?: WebSocket;
+		isDM?: boolean;
+		canMessage?: boolean;
 	} = $props();
 
 	let messages = $state<Message[]>([]);
@@ -38,6 +41,13 @@
 	// Current user ID for ownership checks
 	let currentUserId = $state<string | null>(null);
 	let failedAvatars = $state(new Set<string>());
+	let blockStateTick = $state(0);
+	$effect(() => subscribeBlockState(() => { blockStateTick++; }));
+
+	function blockedAuthor(message: Message): boolean {
+		void blockStateTick;
+		return !isDM && isBlockedByMe(message.author_id);
+	}
 
 	// Context menu state
 	let contextMenu = $state<{ x: number; y: number; message: Message } | null>(null);
@@ -174,6 +184,7 @@
 	}
 
 	function handleSend(content: string) {
+		if (!canMessage) return;
 		if (ws && ws.readyState === WebSocket.OPEN) {
 			sendMessage(ws, channelId, content);
 		}
@@ -194,6 +205,7 @@
 		});
 
 		if (currentUserId && message.author_id === currentUserId) {
+			if (!isDM || canMessage) {
 			items.push({
 				label: 'Edit Message',
 				action: () => {
@@ -201,6 +213,7 @@
 					editContent = message.content;
 				}
 			});
+			}
 			items.push({
 				label: 'Delete Message',
 				danger: true,
@@ -250,7 +263,7 @@
 
 <div class="chat-view">
 	<div class="chat-header">
-		<span class="hash">#</span>
+		<span class="hash">{isDM ? '@' : '#'}</span>
 		<span class="channel-name">{channelName}</span>
 		{#if onToggleMembers}
 			<button class="header-btn" title="Toggle member list" onclick={onToggleMembers}>
@@ -272,6 +285,7 @@
 
 		{#each messages as message, i (message.id)}
 			{@const grouped = shouldGroup(message, messages[i - 1])}
+			{@const blocked = blockedAuthor(message)}
 			<div
 				class="message"
 				class:grouped
@@ -279,12 +293,14 @@
 			>
 				{#if !grouped}
 					<div class="message-header">
-						{#if message.author_avatar_url && !failedAvatars.has(message.author_avatar_url)}
+						{#if blocked}
+							<span class="avatar blocked-avatar">?</span>
+						{:else if message.author_avatar_url && !failedAvatars.has(message.author_avatar_url)}
 							<img class="avatar" src={avatarSrc(message.author_avatar_url!)} alt="" onerror={() => { failedAvatars.add(message.author_avatar_url!); failedAvatars = failedAvatars; }} />
 						{:else}
 							<span class="avatar" style="background: {avatarColor(message.author_username ?? message.author_id)}">{(message.author_username ?? message.author_id).charAt(0).toUpperCase()}</span>
 						{/if}
-						<span class="author">{message.author_display_name ?? message.author_username ?? message.author_id}</span>
+						<span class="author">{blocked ? 'Blocked user' : (message.author_display_name ?? message.author_username ?? message.author_id)}</span>
 						<span class="timestamp">{formatTime(message.created_at)}</span>
 					</div>
 				{/if}
@@ -324,7 +340,7 @@
 		{/if}
 	</div>
 
-	<MessageInput {channelId} {channelName} onSend={handleSend} />
+	<MessageInput {channelId} {channelName} onSend={handleSend} disabled={!canMessage} {isDM} />
 </div>
 
 {#if contextMenu}
@@ -378,6 +394,11 @@
 	.header-btn:hover {
 		color: var(--text-primary);
 		background: var(--bg-hover);
+	}
+
+	.blocked-avatar {
+		background: var(--bg-hover);
+		color: var(--text-muted);
 	}
 
 	.messages {
