@@ -1,72 +1,114 @@
 # Discard
 
-A lightweight, self-hosted Discord alternative built for private friend groups running on Tailscale mesh networks.
+Discard is a self-hosted chat application for private friend groups on Tailscale. A single Go server provides the API, WebSocket text chat, WebRTC voice and screen sharing, and the built Svelte frontend; PostgreSQL stores application data.
 
-## What is this?
+## Stack
 
-Discard is a personalised chat platform — text, voice, video, streaming, and music — designed to run on your own server within a Tailscale network. No cloud dependencies, no data harvesting, no corporate oversight. Just you and your mates.
+|Component|Technology|
+|-|-|
+|Backend|Go 1.27, pgx, Gorilla WebSocket|
+|Frontend|SvelteKit 2, Svelte 5, TypeScript, Vite 8|
+|Database|PostgreSQL 17|
+|Voice and screen sharing|Pion WebRTC with embedded TURN fallback|
+|Authentication|Tailscale identity, with a development-only bypass|
+|Deployment|Single binary, Docker, or Docker Compose|
 
-## Why not just use Discord?
+## Requirements
 
-- Discord's privacy track record is getting worse (data leaks, invasive age verification, ID collection)
-- You don't control your data
-- You're dependent on a company that can change terms, ban servers, or shut down
-- Self-hosted alternatives that exist (Revolt/Stoat, Spacebar, Matrix) are either half-broken, too complex to set up, or missing key features
+- Go 1.27
+- Node.js 24.19 or newer and npm 11
+- PostgreSQL 17
+- `ffmpeg`, `yt-dlp`, and `cwebp` for media processing
+- Tailscale for normal authentication and private-network access
 
-## Why not use existing self-hosted alternatives?
+## Development
 
-
-| Alternative             | Issue                                                                              |
-| ----------------------- | ---------------------------------------------------------------------------------- |
-| **Revolt/Stoat**        | Voice is broken, mid-migration, unstable                                           |
-| **Spacebar**            | Voice/video experimental, no UDP support                                           |
-| **Matrix/Element**      | Complex setup (Synapse + Element + Coturn + LiveKit), feels like Slack not Discord |
-| **Stryve / Wrongthink** | Abandoned or minimal features                                                      |
-
-
-None of these are built for a **trusted private network**. Discard assumes Tailscale handles networking, encryption, and identity — which eliminates the hardest parts of building a chat platform.
-
-## Key differentiators
-
-- **Zero-config networking** — Tailscale handles encryption (WireGuard), NAT traversal, and DNS. No TURN servers, no SSL certs, no port forwarding.
-- **Easy setup** — Single Go binary + Postgres. One-command deploy.
-- **Built for small groups** — Not trying to be Discord at scale. Optimised for private friend groups.
-- **Music bot built-in** — Not a separate service to install. ffmpeg + yt-dlp integrated directly.
-- **Tailscale-native** — Leverages Tailscale node sharing so friends don't need to be on the same Tailnet. Each friend has their own free Tailscale account, server is shared to them.
-
-## Tech stack
-
-
-| Component             | Technology                              |
-| --------------------- | --------------------------------------- |
-| Backend               | Go                                      |
-| Database              | PostgreSQL                              |
-| Real-time             | WebSockets                              |
-| Voice/Video/Streaming | Pion WebRTC                             |
-| Music                 | ffmpeg + yt-dlp + Opus codec            |
-| Frontend              | SvelteKit (Svelte 5, TypeScript)        |
-| File storage          | Disk (WebP conversion for images)       |
-| Networking            | Tailscale (with optional fallback auth) |
-
-
-## Target deployment
-
-- Ubuntu 22.04 LTS server on a Tailscale meshnet
-- Friends connect via browser at `http://discard.your-tailnet:4000`
-- Node sharing used to give friends access without joining your Tailnet
-
-## Quick start (planned)
+Create a PostgreSQL database and start the backend:
 
 ```bash
-# Install
-curl -sL https://github.com/your-username/discard/releases/latest/install.sh | bash
-
-# Run
-discard --port 4000
-
-# Open http://your-machine:4000 from any device on your Tailnet
+export DATABASE_URL='postgres://localhost:5432/discard?sslmode=disable'
+export DISCARD_DEV=true
+go run ./cmd/discard
 ```
 
-## Documentation
+In another terminal, install the frontend dependencies and start Vite:
 
-Deployment guide coming soon.
+```bash
+cd web
+npm ci
+npm run dev
+```
+
+Open `https://localhost:5173`. Development mode exposes fixed test identities through `?dev_user=0` to `?dev_user=3`; never enable `DISCARD_DEV` in production.
+
+## Testing
+
+```bash
+go test -race ./...
+go vet ./...
+cd web
+npm ci
+npm run check
+npm run build
+```
+
+The Playwright suite requires PostgreSQL, the backend on port 4000, and the Vite HTTPS server on port 5173:
+
+```bash
+cd web
+npx playwright install chromium
+npm run test:e2e
+```
+
+The browser suite verifies bidirectional audio over both direct ICE and forced TURN relay connections.
+
+## Docker Compose
+
+Set the required secrets in an ignored `.env` file:
+
+```dotenv
+TS_AUTHKEY=tskey-auth-...
+TURN_SECRET=replace-with-a-random-secret
+```
+
+Then start the Tailscale sidecar, application, and PostgreSQL:
+
+```bash
+docker compose up -d --build
+```
+
+Compose stores PostgreSQL data, uploads, and Tailscale state in named volumes. It does not publish the application on the host network; access is through the Tailscale node and `tailscale serve`.
+
+## Configuration
+
+|Variable|Default|Purpose|
+|-|-|-|
+|`PORT`|`4000`|Backend HTTP port|
+|`DATABASE_URL`|`postgres://localhost:5432/discard?sslmode=disable`|PostgreSQL connection string|
+|`UPLOAD_DIR`|`./uploads`|Uploaded-file directory|
+|`DISCARD_DEV`|`false`|Disable Tailscale authentication and expose fixed development users|
+|`DISCARD_PRODUCTION`|`false`|Prevent accidental use of development authentication in production|
+|`TAILSCALE_API_URL`|Local Tailscale API|Override the identity API endpoint|
+|`TAILSCALE_API_TOKEN`|Unset|Authenticate to the macOS Tailscale local API|
+|`TURN_SECRET`|Random per startup|Shared secret used for ephemeral TURN credentials|
+|`TURN_PUBLIC_IP`|Auto-detected tailnet IP|Override the client-reachable TURN relay address|
+|`TURN_PORT`|`3478`|Embedded UDP TURN listener port|
+|`API_TARGET`|`http://localhost:4000`|Vite development proxy target|
+
+Set a persistent `TURN_SECRET` in deployed environments. Set `TURN_PUBLIC_IP` when automatic tailnet-address discovery is not suitable.
+
+## Blocking Behavior
+
+- Blocking prevents direct-message creation, sending, and editing in both directions.
+- Existing direct-message history remains available, and either participant may delete their own messages.
+- Presence is hidden in both directions.
+- Shared-server messages remain visible. Only the blocker sees the blocked author's name and avatar anonymized.
+- Unblocking restores direct-message sending without deleting or recreating the conversation.
+
+## Production Build
+
+```bash
+make build
+```
+
+The frontend output is copied to `internal/frontend/build` for embedding in the production Go binary. The Dockerfile performs this process in reproducible build stages.

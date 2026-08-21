@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.0
+          cache: true
+      - run: go test -race ./...
+      - run: go vet ./...
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.19.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm install --global npm@11.17.0
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+
+  voice-e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.11-alpine3.23
+        env:
+          POSTGRES_USER: discard
+          POSTGRES_PASSWORD: discard
+          POSTGRES_DB: discard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U discard"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.0
+          cache: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.19.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm install --global npm@11.17.0
+      - run: npm ci
+        working-directory: web
+      - run: npx playwright install --with-deps chromium
+        working-directory: web
+      - name: Start application
+        env:
+          DATABASE_URL: postgres://discard:discard@127.0.0.1:5432/discard?sslmode=disable
+          DISCARD_DEV: "true"
+          TURN_PUBLIC_IP: 127.0.0.1
+          TURN_SECRET: ci-turn-secret
+        run: |
+          go run ./cmd/discard > "$RUNNER_TEMP/discard.log" 2>&1 &
+          cd web
+          npm run dev -- --host 127.0.0.1 > "$RUNNER_TEMP/vite.log" 2>&1 &
+          for attempt in {1..60}; do
+            if curl --fail --insecure --silent https://127.0.0.1:5173/api/me?dev_user=0 > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/discard.log"
+          cat "$RUNNER_TEMP/vite.log"
+          exit 1
+      - run: npm run test:e2e
+        working-directory: web
+      - name: Upload logs and traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-e2e-diagnostics
+          path: |
+            ${{ runner.temp }}/discard.log
+            ${{ runner.temp }}/vite.log
+            web/test-results/
+          if-no-files-found: ignore

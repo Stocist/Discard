@@ -19,6 +19,8 @@ node_modules/
 dist/
 build/
 web/build/
+web/playwright-report/
+web/test-results/
 
 # Embedded frontend build artifacts (keep placeholder)
 internal/frontend/build/

@@ -1,42 +1,17 @@
-# sv
+# Discard Web
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+The SvelteKit frontend for Discard uses Svelte 5, TypeScript, Vite, and the static adapter. In production its output is embedded in and served by the Go backend.
 
-## Creating a project
+## Commands
 
-If you're seeing this, you've probably already done this step. Congrats!
-
-```sh
-# create a new project
-npx sv create my-app
-```
-
-To recreate this project with the same configuration:
-
-```sh
-# recreate this project
-npx sv create --template minimal --types ts --no-install web
-```
-
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
+```bash
+npm ci
 npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
-```
-
-## Building
-
-To create a production version of your app:
-
-```sh
+npm run check
 npm run build
+npm run test:e2e
 ```
 
-You can preview the production build with `npm run preview`.
+Vite serves HTTPS because browser microphone access requires a secure context. API, upload, and WebSocket requests are proxied to `API_TARGET`, which defaults to `http://localhost:4000`.
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+The Playwright voice tests require a running development backend and PostgreSQL database. See the root `README.md` for complete setup instructions.
