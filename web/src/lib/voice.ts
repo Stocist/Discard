@@ -100,7 +100,19 @@ export function joinVoice(ws: WebSocket, channelId: string): void {
 	currentChannelId = channelId;
 	notify();
 	console.log('[voice] joining channel', channelId, 'ws state:', ws.readyState);
-	wsSend(ws, { type: 'voice_join', channel_id: channelId });
+	if (ws.readyState === WebSocket.OPEN) {
+		wsSend(ws, { type: 'voice_join', channel_id: channelId });
+	} else if (ws.readyState === WebSocket.CONNECTING) {
+		ws.addEventListener('open', () => {
+			if (currentChannelId === channelId) {
+				wsSend(ws, { type: 'voice_join', channel_id: channelId });
+			}
+		}, { once: true });
+	} else {
+		currentChannelId = null;
+		notify();
+		setError('Voice connection is unavailable. Reconnect and try again.');
+	}
 }
 
 export function leaveVoice(ws: WebSocket): void {

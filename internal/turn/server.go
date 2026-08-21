@@ -18,15 +18,12 @@ import (
 const defaultPort = 3478
 const credentialTTL = 86400 // 24 hours
 
-// Start creates and starts an embedded TURN server on UDP.
-func Start(realm string) (*turn.Server, error) {
-	port := defaultPort
-	if p := os.Getenv("TURN_PORT"); p != "" {
-		var err error
-		port, err = strconv.Atoi(p)
-		if err != nil {
-			return nil, fmt.Errorf("invalid TURN_PORT: %v", err)
-		}
+// Start creates and starts an embedded TURN server on UDP and returns the
+// secret the API must use when issuing credentials.
+func Start(realm string) (*turn.Server, string, error) {
+	port, err := Port()
+	if err != nil {
+		return nil, "", err
 	}
 
 	secret := os.Getenv("TURN_SECRET")
@@ -34,7 +31,7 @@ func Start(realm string) (*turn.Server, error) {
 		log.Println("WARNING: TURN_SECRET not set, generating random secret (won't persist across restarts)")
 		b := make([]byte, 32)
 		if _, err := rand.Read(b); err != nil {
-			return nil, fmt.Errorf("failed to generate TURN secret: %v", err)
+			return nil, "", fmt.Errorf("failed to generate TURN secret: %v", err)
 		}
 		secret = base64.StdEncoding.EncodeToString(b)
 	}
@@ -42,7 +39,7 @@ func Start(realm string) (*turn.Server, error) {
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	udpListener, err := net.ListenPacket("udp4", addr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to listen on %s: %v", addr, err)
+		return nil, "", fmt.Errorf("failed to listen on %s: %v", addr, err)
 	}
 
 	// The relay address is what the TURN server hands back to the browser as
@@ -80,11 +77,23 @@ func Start(realm string) (*turn.Server, error) {
 	})
 	if err != nil {
 		udpListener.Close()
-		return nil, fmt.Errorf("failed to start TURN server: %v", err)
+		return nil, "", fmt.Errorf("failed to start TURN server: %v", err)
 	}
 
 	log.Printf("TURN server listening on %s (realm: %s)", addr, realm)
-	return s, nil
+	return s, secret, nil
+}
+
+// Port returns the configured UDP listener port.
+func Port() (int, error) {
+	if value := os.Getenv("TURN_PORT"); value != "" {
+		port, err := strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65535 {
+			return 0, fmt.Errorf("invalid TURN_PORT %q: must be between 1 and 65535", value)
+		}
+		return port, nil
+	}
+	return defaultPort, nil
 }
 
 // resolveRelayIP determines the IP the TURN server should advertise as its
