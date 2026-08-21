@@ -1,6 +1,6 @@
 services:
   tailscale:
-    image: tailscale/tailscale:latest
+    image: tailscale/tailscale:v1.102.3
     hostname: discard
     cap_add:
       - NET_ADMIN
@@ -36,7 +36,7 @@ services:
       - DATABASE_URL=postgres://discard:discard@postgres:5432/discard?sslmode=disable
       - UPLOAD_DIR=/data/uploads
       - TAILSCALE_SOCK=/var/run/tailscale/tailscaled.sock
-      - TURN_SECRET=${TURN_SECRET:-discard-turn-secret}
+      - TURN_SECRET=${TURN_SECRET:?TURN_SECRET is required}
     volumes:
       - uploads:/data/uploads
       - tailscale-sock:/var/run/tailscale:ro
@@ -47,7 +47,7 @@ services:
         condition: service_healthy
 
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17.11-alpine3.23
     environment:
       POSTGRES_USER: discard
       POSTGRES_PASSWORD: discard

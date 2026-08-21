@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Discard — Ubuntu 22.04 install script
+# Discard — Ubuntu install script
 # Installs dependencies, builds from source, sets up systemd service.
 # Idempotent: safe to re-run.
 set -euo pipefail
@@ -36,6 +36,7 @@ UPLOAD_DIR="/var/discard/uploads"
 DB_USER="discard"
 DB_NAME="discard"
 DB_PASS="${DISCARD_DB_PASS:-$(openssl rand -hex 16)}"
+TURN_SECRET="${DISCARD_TURN_SECRET:-$(openssl rand -hex 32)}"
 SERVICE_USER="discard"
 PORT="${DISCARD_PORT:-4000}"
 
@@ -46,11 +47,12 @@ apt-get update -qq
 
 info "Installing system dependencies..."
 apt-get install -y -qq \
-    postgresql \
     webp \
     ffmpeg \
+    ca-certificates \
     curl \
     git \
+    gnupg \
     > /dev/null
 
 ok "System packages installed."
@@ -69,24 +71,46 @@ fi
 
 # ─── Node.js (LTS via NodeSource) ───────────────────────────────────────────
 
-if command -v node &>/dev/null; then
+if command -v node &>/dev/null && [[ "$(node -p 'process.versions.node.split(`.`)[0]')" == "24" ]]; then
     ok "Node.js already installed: $(node --version)"
 else
-    info "Installing Node.js 22 LTS..."
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+    info "Installing Node.js 24 LTS..."
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
     apt-get install -y -qq nodejs > /dev/null
     ok "Node.js installed: $(node --version)"
 fi
 
+if [[ "$(npm --version)" != "11.17.0" ]]; then
+    info "Installing npm 11.17.0..."
+    npm install --global npm@11.17.0 --silent
+fi
+ok "npm installed: $(npm --version)"
+
 # ─── Go ──────────────────────────────────────────────────────────────────────
 
-GO_VERSION="1.23.4"
+GO_VERSION="1.27.0"
+
+case "$(dpkg --print-architecture)" in
+    amd64)
+        GO_ARCH="amd64"
+        GO_SHA256="675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685"
+        ;;
+    arm64)
+        GO_ARCH="arm64"
+        GO_SHA256="51798d2c42d0e1c6ed7fd9f48728b4193abac9e8aad6dbac2fe96a81f5909bda"
+        ;;
+    *)
+        fail "Unsupported architecture for Go: $(dpkg --print-architecture)"
+        ;;
+esac
 
 if command -v go &>/dev/null && go version | grep -q "go${GO_VERSION}"; then
     ok "Go ${GO_VERSION} already installed."
 else
     info "Installing Go ${GO_VERSION}..."
-    curl -sL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz
+    printf '%s  %s\n' "${GO_SHA256}" /tmp/go.tar.gz | sha256sum --check --status \
+        || fail "Go archive checksum verification failed."
     rm -rf /usr/local/go
     tar -C /usr/local -xzf /tmp/go.tar.gz
     rm /tmp/go.tar.gz
@@ -100,6 +124,15 @@ else
 fi
 
 # ─── PostgreSQL ──────────────────────────────────────────────────────────────
+
+info "Installing PostgreSQL 17..."
+install -d /usr/share/postgresql-common/pgdg
+curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    | gpg --dearmor --yes -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg
+printf 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg] https://apt.postgresql.org/pub/repos/apt %s-pgdg main\n' \
+    "${VERSION_CODENAME:-jammy}" > /etc/apt/sources.list.d/pgdg.list
+apt-get update -qq
+apt-get install -y -qq postgresql-17 > /dev/null
 
 info "Configuring PostgreSQL..."
 systemctl enable --now postgresql > /dev/null 2>&1
@@ -165,11 +198,17 @@ ENV_FILE="${INSTALL_DIR}/discard.env"
 
 if [[ -f "${ENV_FILE}" ]]; then
     warn "Environment file already exists: ${ENV_FILE} (not overwriting)."
+    if ! grep -q '^TURN_SECRET=' "${ENV_FILE}"; then
+        printf '\nTURN_SECRET=%s\n' "${TURN_SECRET}" >> "${ENV_FILE}"
+        chmod 600 "${ENV_FILE}"
+        ok "Added a persistent TURN secret to the existing environment file."
+    fi
 else
     cat > "${ENV_FILE}" <<EOF
 DATABASE_URL=postgres://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}?sslmode=disable
 UPLOAD_DIR=${UPLOAD_DIR}
 PORT=${PORT}
+TURN_SECRET=${TURN_SECRET}
 EOF
     chown "${SERVICE_USER}:${SERVICE_USER}" "${ENV_FILE}"
     chmod 600 "${ENV_FILE}"
